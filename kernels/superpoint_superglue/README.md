@@ -19,6 +19,7 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `maxpool_shift.asm` | 3x3 sliding-window max-pool | shifted contiguous loads (precomputed offsets) — **gather-free, host-free** |
 | `cell_nms.asm` | keypoint detection (NMS alternative) | channel-space per-cell peak + soft-argmax sub-pixel coords; **no depth-to-space, no gather** |
 | `attention_scores.asm` | attention QKᵀ | scaled dot product `(q·k)/√d` |
+| `conv_fp32.asm` | 3x3 convolution (FP32, from scratch) | VLIW-packed MAC (1 cycle/tap), shifted loads, zero-pad; ~57% ALU util |
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
 | `sinkhorn_iter.asm` | optimal-matching layer | log-domain row half-step (logsumexp→max) |
 | `sinkhorn_col.asm` | optimal-matching layer | log-domain column half-step (transpose-free, via element-wise max across rows) |
