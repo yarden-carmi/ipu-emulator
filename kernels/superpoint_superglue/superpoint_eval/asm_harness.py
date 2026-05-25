@@ -37,7 +37,10 @@ def conv_fp32_layer(x, w, b, wcrop=None):
     assert CinP * 9 <= 128, f"Cin too large for R0 ({CinP*9}>128); use tiled kernel"
     Hp = H + 2
     CS = Hp * 512                        # bytes per padded input plane
-    IN = 0x0; OUTB = 0x100000; WB = 0x1F0000
+    IN = 0x0
+    OUTB = (((CinP * CS) >> 9) + 2) << 9          # right after input region
+    WB = OUTB + H * 512 + 512
+    assert WB + 512 <= (2 << 20), "XMEM overflow"
     out = np.zeros((Cout, H, wcrop), np.float32)
     tot = mult_a = acc_a = 0
     s = IpuState(wide_vector_debug=True, wide_vector_arithmetic=WideVectorArithmetic.FP32)
@@ -88,7 +91,10 @@ def conv_fp32_tiled_layer(x, w, b, wcrop=None, G=13, relu=True):
     Ctot = ngroups * G                               # padded channel count
     assert G * 9 <= 128
     Hp = H + 2; CS = Hp * 512
-    IN = 0x0; OUTB = 0x100000; WB = 0x1C0000
+    IN = 0x0
+    OUTB = (((Ctot * CS) >> 9) + 2) << 9          # right after input region
+    WB = OUTB + H * 512 + 512
+    assert WB + ngroups * G * 9 * 4 <= (2 << 20), "XMEM overflow"
     gws = G * 9 * 4
     out = np.zeros((Cout, H, wcrop), np.float32)
     tot = mult_a = acc_a = 0
