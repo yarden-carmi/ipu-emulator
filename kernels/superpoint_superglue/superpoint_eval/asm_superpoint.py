@@ -33,31 +33,22 @@ def maxpool2(x):  # host 2x2 stride-2 max (gather; documented host step)
     C, H, Wd = x.shape
     return x[:, :H // 2 * 2, :Wd // 2 * 2].reshape(C, H // 2, 2, Wd // 2, 2).max(axis=(2, 4))
 
-def torch_superpoint(img):
-    import torch
-    sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "third_party", "superpoint"))
-    from demo_superpoint import SuperPointNet
-    net = SuperPointNet()
-    net.load_state_dict(torch.load(os.path.join(HERE, "..", "..", "..", "third_party",
-                                                 "superpoint", "superpoint_v1.pth"), map_location="cpu"))
-    net.eval()
-    acts = {}
-    x = torch.from_numpy(img)[None, None]
-    relu = torch.nn.functional.relu
-    def C(l, t, r=True):
-        w, b = wload(l)
-        import torch.nn.functional as F
-        o = F.conv2d(t, torch.from_numpy(w), torch.from_numpy(b), padding=1 if w.shape[2] == 3 else 0)
-        return relu(o) if r else o
-    x = C("conv1a", x); acts["conv1a"] = x
-    x = C("conv1b", x); acts["conv1b"] = x
-    x = torch.nn.functional.max_pool2d(x, 2)
-    x = C("conv2a", x); x = C("conv2b", x); x = torch.nn.functional.max_pool2d(x, 2)
-    x = C("conv3a", x); x = C("conv3b", x); x = torch.nn.functional.max_pool2d(x, 2)
+def ref_superpoint(img):
+    """SuperPoint detector forward in NumPy (same conv+bias+ReLU math as the
+    pretrained net; torch/cv2 not needed). Returns `semi` (65 ch)."""
+    def C(layer, t, relu=True):
+        w, b = wload(layer)
+        if w.shape[2] == 1:                       # 1x1 -> center-only 3x3
+            w33 = np.zeros((w.shape[0], w.shape[1], 3, 3), np.float32)
+            w33[:, :, 1, 1] = w[:, :, 0, 0]; w = w33
+        return modified_ops.conv2d_relu(t, w, b, relu=relu)
+    x = img[None]
+    x = C("conv1a", x); x = C("conv1b", x); x = maxpool2(x)
+    x = C("conv2a", x); x = C("conv2b", x); x = maxpool2(x)
+    x = C("conv3a", x); x = C("conv3b", x); x = maxpool2(x)
     x = C("conv4a", x); x = C("conv4b", x)
-    cPa = C("convPa", x); semi = C("convPb", cPa, r=False)
-    acts["semi"] = semi
-    return semi[0].detach().numpy(), {k: v[0].detach().numpy() for k, v in acts.items()}
+    cPa = C("convPa", x); semi = C("convPb", cPa, relu=False)
+    return semi
 
 def main():
     H = Wd = 32                          # /8 -> 4x4 detector grid
@@ -74,14 +65,14 @@ def main():
     cPa = asm_conv(x, "convPa")
     semi_asm = asm_conv(cPa, "convPb", relu=False)     # (65, Hc, Wc)
 
-    # ---- torch reference ----
+    # ---- numpy reference (true SuperPoint conv+bias+relu math) ----
     try:
-        semi_t, _ = torch_superpoint(img)
+        semi_t = ref_superpoint(img)
         Hc, Wc = semi_asm.shape[1], semi_asm.shape[2]
         semi_t = semi_t[:, :Hc, :Wc]
         d = np.abs(semi_asm - semi_t)
         print(f"\n[compare as one] detector logits `semi` (65 x {Hc} x {Wc}):")
-        print(f"  asm vs torch SuperPoint: max {d.max():.2e}  mean {d.mean():.4e}  "
+        print(f"  asm vs SuperPoint (numpy): max {d.max():.2e}  mean {d.mean():.4e}  "
               f"{'MATCH' if d.max() < 5e-2 else 'DIFF'}")
         # detector decision: torch softmax-argmax vs our max-over-64 argmax
         sm = np.exp(semi_t - semi_t.max(0)); sm /= sm.sum(0)
