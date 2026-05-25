@@ -18,7 +18,7 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `maxpool.asm` | keypoint max-pool / NMS core | element-wise max over K gathered taps |
 | `attention_scores.asm` | attention QKᵀ | scaled dot product `(q·k)/√d` |
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
-| `sinkhorn_iter.asm` | optimal-matching layer | one standard-domain row-normalization half-step |
+| `sinkhorn_iter.asm` | optimal-matching layer | one log-domain row half-step (logsumexp→max) |
 | `argmax_match.asm` | match read-out | temperature hard-argmax → one-hot assignment row |
 | `topk.asm` | keypoint selection | confidence threshold `relu(x−thr)` + top-1 value |
 | `pixel_shuffle.asm` | heatmap reshape | depth-to-space plane relocation (strided copy) |
@@ -73,10 +73,11 @@ no gather/scatter load-store, and no logarithm**. Consequences:
 - **`argmax_match.asm`** emits a one-hot **vector** (assignment row), not an
   integer index — which is exactly what the assignment matrix needs; mutual-NN
   = AND of row one-hot and column one-hot (run on `Pᵀ`).
-- **`sinkhorn_iter.asm`** does the **row** half-step only; the column half-step
-  needs transposed/strided column gathers, so the host transposes `P` (or stores
-  `Pᵀ`) between half-steps and re-calls this kernel. Log-domain Sinkhorn is not
-  used (no `log`); the standard positive-domain iteration is used instead.
+- **`sinkhorn_iter.asm`** runs in the **log domain** but, lacking a `log`,
+  replaces `logsumexp` with `max` (the tropical/hard limit): each row update is
+  `Z_ij ← Z_ij − max_j Z_ij`. It does the **row** half-step only; the column
+  half-step needs transposed/strided column gathers, so the host transposes `Z`
+  (or stores `Zᵀ`) between half-steps and re-calls this kernel.
 - **`pixel_shuffle.asm`** relocates whole channel planes (the contiguous part of
   depth-to-space); the fine within-plane interleave is a per-element scatter the
   host completes (or the source is pre-laid-out so a plane copy suffices).

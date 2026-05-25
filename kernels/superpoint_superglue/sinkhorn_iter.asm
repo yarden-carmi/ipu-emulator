@@ -1,40 +1,46 @@
 // ============================================================================
-// sinkhorn_iter.asm  --  one ROW-normalization half-step of Sinkhorn matching
+// sinkhorn_iter.asm  --  one ROW half-step of LOG-domain Sinkhorn (max variant)
 // ----------------------------------------------------------------------------
 // Layer covered:
-//   * SuperGlue optimal-matching layer: the iterative Sinkhorn normalization
-//     of the (augmented, exponentiated) score matrix toward a doubly-stochastic
-//     assignment.
+//   * SuperGlue optimal-matching layer: the iterative log-domain Sinkhorn
+//     normalization of the (dustbin-augmented) log-score matrix Z toward a
+//     doubly-stochastic assignment.
 //
-// DOMAIN CHOICE (important): the standard log-domain Sinkhorn uses logsumexp,
-//   which needs a logarithm. The ISA exposes exp2 but NO log, so this kernel
-//   implements the *standard-domain* iteration on the positive affinity matrix
-//   P (P_ij >= 0, e.g. P = 2^score):
-//       row half-step:  P_ij <- P_ij / sum_j P_ij      (each row sums to 1)
-//   A full Sinkhorn step alternates this with the analogous COLUMN
-//   normalization. The column half-step needs transposed/strided column loads
-//   the contiguous-only LDR cannot gather; the host transposes P between
-//   half-steps (or stores P^T) and calls this same kernel. See README.
+// LOGSUMEXP -> MAX:
+//   The exact log-domain row update subtracts the row log-sum-exp:
+//       Z_ij <- Z_ij - logsumexp_j(Z_ij).
+//   The ISA has no logarithm, so this kernel uses the tropical (max-plus)
+//   surrogate logsumexp_j(Z) ~ max_j(Z):
+//       Z_ij <- Z_ij - max_j(Z_ij).
+//   After the step each row's maximum is 0 and all other entries are <= 0
+//   (i.e. exp(row) has its peak normalized to 1). This is the hard/tropical
+//   Sinkhorn limit; it needs no reciprocal and no positivity assumption on Z.
 //
-// Layout: P is row-major in XMEM; each row is a contiguous 128-lane (512-byte)
+// A full Sinkhorn step alternates this with the COLUMN half-step
+// (Z_ij <- Z_ij - max_i Z_ij). Columns are not contiguous under the
+// contiguous-only LDR, so the host transposes Z (or stores Z^T) between
+// half-steps and re-calls this same kernel. See README.
+//
+// Layout: Z is row-major in XMEM; each row is a contiguous 128-lane (512-byte)
 //   plane.  Row r is at  mat_addr + r * row_stride.  cols <= 128 (incl. dustbin).
 //
-// Numeric mode: WIDE-VECTOR FP32.
+// Numeric mode: WIDE-VECTOR FP32 (Z holds log-scores, any sign).
 //
-// Per row:  build row in R_ACC ; AGG sum inv -> aaq0 = 1/rowsum ;
-//           MULT.VE.AAQ scales the row ; store back in place.
+// Per row:  build Z[row] in R_ACC ; AGG max value_cr(-1) -> aaq0 = -max(row) ;
+//           ACC.ADD_AAQ.FIRST -> Z[row] - max(row) ; store back in place.
 //
 // Register / memory contract:
 //   CR0  = 0                  (zero base)
 //   CR1  = 1                  (one; loop increment)
-//   CR2  = mat_addr           base of row-major matrix P (output in place)
-//   CR4  = ones_addr          128xf32 all-1.0
+//   CR2  = mat_addr           base of row-major log-score matrix Z (in place)
+//   CR4  = ones_addr          128xf32 all-1.0  (for the row -> R_ACC copy)
 //   CR6  = num_rows           number of rows R
 //   CR7  = row_stride         byte stride between rows (e.g. 512)
 //   CR8  = num_cols           valid columns per row (1..128)
+//   CR9  = float32_bits(-1.0) = 0xBF800000  (negate-the-max constant)
 //   CR15 = dtype sentinel (INT8)
 //
-// Output: P normalized so every row sums to 1 (written back in place).
+// Output: Z with each row shifted so its row-max is 0 (written back in place).
 // ============================================================================
 
     SET                 lr0 cr0 ;;          // lr0 = 0
@@ -46,22 +52,17 @@
     LDR_CYCLIC_MULT_REG lr0 cr4 lr0 ;;      // R_CYCLIC = ones (for row->R_ACC copy)
 
 row_loop:
-    // ---- bring P[row] into R_ACC -----------------------------------------
-    LDR_MULT_REG        r0 lr3 cr0 ;;       // R0       = P[row]   (addr = lr3)
-    MULT.EE             r0 lr0 0 lr0 ;;      // MULT_RES = P[row] * 1.0
-    ACC.FIRST ;;                            // R_ACC    = P[row]
+    // ---- bring Z[row] into R_ACC (MULT_RES retains Z[row]) ---------------
+    LDR_MULT_REG        r0 lr3 cr0 ;;       // R0       = Z[row]   (addr = lr3)
+    MULT.EE             r0 lr0 0 lr0 ;;      // MULT_RES = Z[row] * 1.0
+    ACC.FIRST ;;                            // R_ACC    = Z[row]
 
-    // ---- aaq0 = 1 / sum_j P[row,j] ---------------------------------------
-    AGG.FIRST           sum inv lr8 cr0 aaq0 ;;
+    // ---- aaq0 = -max_j Z[row,j] ------------------------------------------
+    AGG.FIRST           max value_cr lr8 cr9 aaq0 ;;   // max * (-1) = -max
 
-    // ---- scale row by 1/rowsum and store in place ------------------------
-    LDR_CYCLIC_MULT_REG lr3 cr0 lr0 ;;      // R_CYCLIC = P[row]
-    MULT.VE.AAQ         lr0 0 lr0 aaq0 ;;    // MULT_RES = P[row,j] / rowsum
-    ACC.FIRST ;;                            // R_ACC    = normalized row
+    // ---- Z[row] - max(row)  (MULT_RES still = Z[row]) --------------------
+    ACC.ADD_AAQ.FIRST   aaq0 ;;             // R_ACC = Z[row] + (-max)
     STR_ACC_REG         lr3 cr0 ;;          // write back at row address
-
-    // restore ones in R_CYCLIC for the next iteration's copy
-    LDR_CYCLIC_MULT_REG lr0 cr4 lr0 ;;      // R_CYCLIC = ones
 
     ADD                 lr3 lr3 cr7 ;;      // next row
     ADD                 lr5 lr5 cr1 ;;      // row counter += 1
