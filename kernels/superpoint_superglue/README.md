@@ -19,7 +19,25 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `maxpool_shift.asm` | 3x3 sliding-window max-pool | shifted contiguous loads (precomputed offsets) — **gather-free, host-free** |
 | `cell_nms.asm` | keypoint detection (NMS alternative) | channel-space per-cell peak + soft-argmax sub-pixel coords; **no depth-to-space, no gather** |
 | `attention_scores.asm` | attention QKᵀ | scaled dot product `(q·k)/√d` |
-| `conv_fp32.asm` | 3x3 convolution (FP32, from scratch) | VLIW-packed MAC (1 cycle/tap), shifted loads, zero-pad; ~57% ALU util |
+| `conv_fp32.asm` | 3x3 convolution (FP32, from scratch) | VLIW-packed MAC (1 cycle/tap), shifted loads, zero-pad; ~57-65% ALU util |
+| `superpoint_detect.asm` | detector confidence + fixed-threshold select | cells-in-lanes, max over channel planes packed (~86% ALU util), dense host-free output |
+
+## SuperPoint detector pipeline (host-free through selection)
+
+`superpoint_pipeline.py` runs a **bank-swap pipeline** — conv_fp32 (×Nc detector
+channels) → superpoint_detect — entirely on-device; the host only swaps IMEM
+banks between launches (no computation/decisions) until after the threshold
+selection. All FP32 (single mode). Each kernel ≤128 IMEM words.
+
+**VLIW slot-packing + unroll** lifts ALU utilization from ~15% (one-slot-per-
+compound style) to **57-86%**: each conv tap and each detector channel is a
+single compound issuing LR + XMEM + MULT + ACC (+COND) in parallel.
+
+Measured (emulator, wide FP32):
+- Functional: chained conv→detect exact vs NumPy (0 mismatches, 1.4e-6).
+- **640×480 (80×60=4800 cells, Cin=14, Nc=65):** detector conv 11,586 cyc/out-
+  channel ×65 = 753,090 cyc (65% MULT); detect+threshold 2,974 cyc (86% MULT/ACC);
+  **total host-free conv→detect→select ≈ 756,064 cycles.**
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
 | `sinkhorn_iter.asm` | optimal-matching layer | log-domain row half-step (logsumexp→max) |
 | `sinkhorn_col.asm` | optimal-matching layer | log-domain column half-step (transpose-free, via element-wise max across rows) |
