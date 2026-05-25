@@ -22,7 +22,21 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `conv_fp32.asm` | 3x3 convolution (FP32, from scratch) | VLIW-packed MAC (1 cycle/tap), shifted loads, zero-pad; ~57-65% ALU util |
 | `superpoint_detect.asm` | detector confidence + fixed-threshold select | cells-in-lanes, max over channel planes packed (~86% ALU util), dense host-free output |
 
-## SuperPoint detector pipeline (host-free through selection)
+## Single-file fused SuperPoint (`superpoint.asm`)
+
+`superpoint.asm` is the **literal "SuperPoint in one `.asm`"**: conv + detect +
+threshold fused into **one file, one launch**, with **loops but not nested** —
+a flat conv loop over (output-channel, row) with a channel-**wrap conditional**
+(forward branch, not a nested loop) and Cin·9 taps unrolled, then a flat detect
+loop over tiles with the Nc channels unrolled. Config baked by unrolling
+(Cin=2, Nc=4 in the committed file; larger configs grow the unroll).
+
+- **Emulator-only**: 71 words — fits the emulator's 1024-word `INST_MEM` but
+  overflows the **128-word hardware bank**, so the bank-swap pipeline
+  (`superpoint_pipeline.py`) remains the hardware-faithful form.
+- Validated exact vs NumPy (0/640, 8.7e-7).
+- **640×480 spatial (4800 cells): 8,026 cycles, ~58% MULT / 61% ACC**, fully
+  on-device (no host, no nesting).
 
 `superpoint_pipeline.py` runs a **bank-swap pipeline** — conv_fp32 (×Nc detector
 channels) → superpoint_detect — entirely on-device; the host only swaps IMEM
