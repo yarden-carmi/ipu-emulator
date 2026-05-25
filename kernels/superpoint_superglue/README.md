@@ -15,7 +15,8 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `softmax.asm` | detector-head channel softmax / attention softmax | stable base-2 softmax over ≤128 lanes |
 | `l2_normalize.asm` | descriptor normalization | `x / ‖x‖₂` |
 | `layernorm.asm` | SuperGlue MLP/attention norm | `γ·(x−μ)/σ + β` |
-| `maxpool.asm` | keypoint max-pool / NMS core | element-wise max over K gathered taps |
+| `maxpool.asm` | keypoint max-pool / NMS core | element-wise max over K gathered taps (host gather) |
+| `maxpool_shift.asm` | 3x3 sliding-window max-pool | shifted contiguous loads (precomputed offsets) — **gather-free, host-free** |
 | `cell_nms.asm` | keypoint detection (NMS alternative) | channel-space per-cell peak + soft-argmax sub-pixel coords; **no depth-to-space, no gather** |
 | `attention_scores.asm` | attention QKᵀ | scaled dot product `(q·k)/√d` |
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
