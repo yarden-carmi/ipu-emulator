@@ -72,10 +72,14 @@ def conv_fp32_layer(x, w, b, wcrop=None):
     return out, tot, 100 * mult_a / tot, 100 * acc_a / tot
 
 
-def conv_fp32_tiled_layer(x, w, b, wcrop=None, G=13):
-    """Channel-tiled conv (any Cin) via conv_fp32_tiled.asm. Bias folded as an
-    all-ones channel (center-tap weight = bias); channels padded to G*ngroups."""
-    PROG = _load("conv_fp32_tiled.asm")
+def conv_fp32_tiled_layer(x, w, b, wcrop=None, G=13, relu=True):
+    """Channel-tiled conv (any Cin) via conv_fp32_tiled[_norelu].asm. Bias folded
+    as an all-ones channel (center-tap weight = bias); channels padded to
+    G*ngroups. Accepts 3x3 or 1x1 weights (1x1 expanded to center-only 3x3)."""
+    PROG = _load("conv_fp32_tiled.asm" if relu else "conv_fp32_tiled_norelu.asm")
+    if w.shape[2] == 1:                              # 1x1 conv -> center-only 3x3
+        w33 = np.zeros((w.shape[0], w.shape[1], 3, 3), np.float32)
+        w33[:, :, 1, 1] = w[:, :, 0, 0]; w = w33
     Cin, H, W = x.shape
     Cout = w.shape[0]
     wcrop = wcrop or min(W, 126)
