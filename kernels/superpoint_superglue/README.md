@@ -16,6 +16,7 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `l2_normalize.asm` | descriptor normalization | `x / ‖x‖₂` |
 | `layernorm.asm` | SuperGlue MLP/attention norm | `γ·(x−μ)/σ + β` |
 | `maxpool.asm` | keypoint max-pool / NMS core | element-wise max over K gathered taps |
+| `cell_nms.asm` | keypoint detection (NMS alternative) | channel-space per-cell peak + soft-argmax sub-pixel coords; **no depth-to-space, no gather** |
 | `attention_scores.asm` | attention QKᵀ | scaled dot product `(q·k)/√d` |
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
 | `sinkhorn_iter.asm` | optimal-matching layer | log-domain row half-step (logsumexp→max) |
