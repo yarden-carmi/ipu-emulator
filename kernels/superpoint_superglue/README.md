@@ -24,6 +24,7 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `sinkhorn_iter_mt.asm` | optimal-matching layer | multi-tile row half-step (C>128 columns, T=⌈C/128⌉ col-tiles) |
 | `sinkhorn_col_mt.asm` | optimal-matching layer | multi-tile column half-step (C>128 columns, transpose-free) |
 | `argmax_match.asm` | match read-out | temperature hard-argmax → one-hot assignment row |
+| `argmax_match_mt.asm` | match read-out | multi-tile one-hot for C>128 wide rows (e.g. 512/513) |
 | `topk.asm` | keypoint selection | confidence threshold `relu(x−thr)` + top-1 value |
 | `pixel_shuffle.asm` | heatmap reshape | depth-to-space plane relocation (strided copy) |
 
