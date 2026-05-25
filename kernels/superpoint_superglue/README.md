@@ -20,6 +20,8 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `softmax.asm` (reused) | attention softmax | (same kernel) |
 | `sinkhorn_iter.asm` | optimal-matching layer | log-domain row half-step (logsumexp→max) |
 | `sinkhorn_col.asm` | optimal-matching layer | log-domain column half-step (transpose-free, via element-wise max across rows) |
+| `sinkhorn_iter_mt.asm` | optimal-matching layer | multi-tile row half-step (C>128 columns, T=⌈C/128⌉ col-tiles) |
+| `sinkhorn_col_mt.asm` | optimal-matching layer | multi-tile column half-step (C>128 columns, transpose-free) |
 | `argmax_match.asm` | match read-out | temperature hard-argmax → one-hot assignment row |
 | `topk.asm` | keypoint selection | confidence threshold `relu(x−thr)` + top-1 value |
 | `pixel_shuffle.asm` | heatmap reshape | depth-to-space plane relocation (strided copy) |
