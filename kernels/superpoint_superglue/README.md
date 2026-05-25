@@ -26,6 +26,7 @@ contract** (which CRs hold which addresses/constants, input/output layout).
 | `argmax_match.asm` | match read-out | temperature hard-argmax → one-hot assignment row |
 | `argmax_match_mt.asm` | match read-out | multi-tile one-hot for C>128 wide rows (e.g. 512/513) |
 | `topk.asm` | keypoint selection | confidence threshold `relu(x−thr)` + top-1 value |
+| `topk_mt.asm` | keypoint selection (C>128) | global top-1 + count-above-threshold (`Σ sigmoid`) → host-calibrated top-k |
 | `pixel_shuffle.asm` | heatmap reshape | depth-to-space plane relocation (strided copy) |
 
 ## Numeric mode (required)
