@@ -230,7 +230,7 @@ scores into one vector. No attention masking is applied.
 
 ---
 
-## 6. Sinkhorn iteration — `sinkhorn_iter.asm`
+## 6. Sinkhorn iteration — `sinkhorn_iter.asm` (row) + `sinkhorn_col.asm` (column)
 
 ### Theory (log-domain optimal transport)
 SuperGlue normalizes a dustbin-augmented log-score matrix `Z` toward a doubly
@@ -246,9 +246,11 @@ for _ in range(iters):
     Z = Z - logsumexp(Z, axis=0, keepdims=True)
 ```
 
-### Implementation (max in place of logsumexp; row half-step)
+### Implementation (max in place of logsumexp; both half-steps on-device)
 No logarithm exists, so this uses the **tropical (max-plus) surrogate**
-`logsumexp_j(Z) → max_j(Z)`:
+`logsumexp(Z) → max(Z)`.
+
+**Row half-step — `sinkhorn_iter.asm`** (`Z_ij ← Z_ij − max_j Z_ij`):
 ```
 for each row r:                            # loop over rows
     a = Z[r]                               # load, MULT.EE x1, ACC.FIRST
@@ -258,15 +260,38 @@ for each row r:                            # loop over rows
 ```
 Validated: `[-2,0.5,1,-0.3] → [-3,-0.5,0,-1.3]`, row-max = 0.
 
-### Parity — **APPROXIMATE + ROW-ONLY**
+**Column half-step — `sinkhorn_col.asm`** (`Z_ij ← Z_ij − max_i Z_ij`),
+transpose-free. The per-COLUMN max is the ELEMENT-WISE max of the row vectors,
+so it is built by sweeping contiguous rows with `ACC.MAX` (no strided column
+read), then subtracted from every row:
+```
+# Pass 1: colmax_j = max_i Z_ij   (element-wise max across rows)
+q = -inf                                   # seed for 3-way ACC.MAX
+a = Z[row0]                                # ACC.FIRST
+for r in 1..R-1:
+    m = Z[row_r]                           # LDR + MULT.EE x1
+    a_i = max(a_i, Z[row_r]_i, -inf)       # ACC.MAX  => running colmax
+store a -> colmax ; negcol = -colmax       # negate via MULT.EE with -1 plane
+
+# Pass 2: subtract the colmax vector from every row
+for each row r:
+    a = Z[row_r]                           # ACC.FIRST
+    a = a + negcol                          # vector add: MULT.EE(-colmax)x1 + ACC
+    store a                                 # column-max is now 0
+```
+Validated on a 3×4 matrix: after the kernel every column's max = 0 and each
+entry equals `Z_ij − max_i Z_ij` to 1e-6. A full iteration = row kernel then
+column kernel, entirely on-device.
+
+### Parity — **APPROXIMATE (logsumexp→max); now FULL-iteration on-device**
 - **logsumexp → max.** Since `logsumexp(Z) = max(Z) + log Σ exp(Z−max) ≥ max(Z)`,
   the max underestimates the true normalizer by `log(effective #entries)`. The
   two coincide only in the sharp/low-temperature limit. This yields the
   **hard/tropical** transport (min-/max-plus semiring), not the exact entropic
-  Sinkhorn.
-- **Row half only.** The column half-step `Z_ij −= max_i Z_ij` needs transposed
-  (strided) column reads the contiguous-only load cannot gather; the host
-  transposes `Z` (or stores `Zᵀ`) and re-calls this kernel.
+  Sinkhorn (which would need `log`).
+- **No transpose needed.** Both the row and column half-steps are expressible on
+  contiguous row planes (the column max via element-wise `ACC.MAX` across rows),
+  so a complete iteration runs on-device without host transposition.
 
 ---
 
@@ -372,14 +397,16 @@ source so a plane copy finishes the reshape.
 | `layernorm` | **Near-full** | no `ε`; caller folds `sqrt(N)` into `γ` |
 | `attention_scores` | **Full per element** | full matrix = host loop; no mask |
 | `maxpool` / NMS | **Compute-only** | window gather + suppression test offloaded |
-| `sinkhorn_iter` | **Approx + row-only** | `logsumexp→max`; column step host-transposed |
+| `sinkhorn_iter` + `sinkhorn_col` | **Approx, full iteration on-device** | `logsumexp→max`; column step transpose-free via element-wise `ACC.MAX` across rows |
 | `argmax_match` | **Approx** | one-hot not index; mutual/threshold offloaded |
 | `topk` | **Partial** | threshold+max only; no ranked indices |
 | `pixel_shuffle` | **Minimal** | plane copy only; no within-plane interleave |
 
 **Root-cause ISA gaps:** (1) no lane-index→scalar move, (2) no element-wise
 vector compare, (3) no gather/scatter, (4) no logarithm (base-2 `exp2` only),
-(5) no scalar-add before `rsqrt`. The operations with full parity (softmax, L2,
+(5) no scalar-add before `rsqrt`. (Note: the Sinkhorn column step initially
+looked gather-bound under gap 3, but is avoided by computing the column max as
+an element-wise `ACC.MAX` across contiguous rows.) The operations with full parity (softmax, L2,
 dot-product, element-wise max) are exactly the dense reductions/activations the
 `AGG`/`ACTIVATE`/`MULT` datapath was designed for; everything needing
 data-dependent addressing or index materialization is only partially
