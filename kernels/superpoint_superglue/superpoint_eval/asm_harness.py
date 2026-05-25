@@ -70,3 +70,56 @@ def conv_fp32_layer(x, w, b, wcrop=None):
             for c in range(wcrop):
                 out[oc, y, c] = struct.unpack_from("<f", d, c * 4)[0]
     return out, tot, 100 * mult_a / tot, 100 * acc_a / tot
+
+
+def conv_fp32_tiled_layer(x, w, b, wcrop=None, G=13):
+    """Channel-tiled conv (any Cin) via conv_fp32_tiled.asm. Bias folded as an
+    all-ones channel (center-tap weight = bias); channels padded to G*ngroups."""
+    PROG = _load("conv_fp32_tiled.asm")
+    Cin, H, W = x.shape
+    Cout = w.shape[0]
+    wcrop = wcrop or min(W, 126)
+    CinP = Cin + 1                                   # +1 ones channel (bias)
+    ngroups = (CinP + G - 1) // G
+    Ctot = ngroups * G                               # padded channel count
+    assert G * 9 <= 128
+    Hp = H + 2; CS = Hp * 512
+    IN = 0x0; OUTB = 0x100000; WB = 0x1C0000
+    gws = G * 9 * 4
+    out = np.zeros((Cout, H, wcrop), np.float32)
+    tot = mult_a = acc_a = 0
+    s = IpuState(wide_vector_debug=True, wide_vector_arithmetic=WideVectorArithmetic.FP32)
+    s.regfile.set_cr(15, DType.INT8); s.regfile.set_cr(0, 0); s.regfile.set_cr(1, 1)
+    for ci in range(Ctot):                           # input planes
+        for r in range(Hp):
+            row = [0.0] * 128
+            if 1 <= r <= H:
+                if ci < Cin:
+                    for c in range(wcrop): row[c + 1] = float(x[ci, r - 1, c])
+                elif ci == Cin:
+                    for c in range(wcrop): row[c + 1] = 1.0     # ones (bias) channel
+            _f32(s, IN + ci * CS + r * 512, row)
+    for cr, v in [(2, IN), (4, CS), (5, 512), (6, H), (8, 504), (10, 128),
+                  (11, G), (12, ngroups), (13, gws)]:
+        s.regfile.set_cr(cr, v)
+    for oc in range(Cout):
+        for g in range(ngroups):                     # weights per group [cig][tap]
+            wf = []
+            for cig in range(G):
+                ci = g * G + cig
+                if ci < Cin:
+                    wf += [float(w[oc, ci, kr, kc]) for kr in range(3) for kc in range(3)]
+                elif ci == Cin:
+                    wf += [0, 0, 0, 0, float(b[oc]), 0, 0, 0, 0]   # bias at center
+                else:
+                    wf += [0.0] * 9                                 # padding channel
+            _f32(s, WB + g * gws, wf)
+        s.regfile.set_cr(3, OUTB); s.regfile.set_cr(9, WB)
+        s.program_counter = 0; s.stats = RunStats()
+        load_program(s, list(PROG)); run_until_complete(s, max_cycles=40_000_000)
+        st = s.stats; tot += st.total_cycles; mult_a += st.mult_active_cycles; acc_a += st.acc_active_cycles
+        for y in range(H):
+            d = s.xmem.read_address(OUTB + y * 512, 512)
+            for c in range(wcrop):
+                out[oc, y, c] = struct.unpack_from("<f", d, c * 4)[0]
+    return out, tot, 100 * mult_a / tot, 100 * acc_a / tot

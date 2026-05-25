@@ -15,11 +15,14 @@ operation at a time.
 4. `compare.py` — per op: `.asm` vs `modified_ops` (same math, expect ≤1e-3) and
    `.asm` vs torch SuperPoint (the true op). Reports error + cycles + ALU util.
 
-## Status
-- **conv1a** (Cin=1→64, 3×3): `.asm` matches torch SuperPoint to **1.2e-4**
-  (FP32 accumulation-order rounding); ~48% MULT util.
-- Phase 2 (Cin>14 layers via channel-tiled conv, detector/descriptor heads):
-  in progress.
+## Status (asm vs real torch SuperPoint)
+- **conv1a** (Cin=1→64, 3×3, `conv_fp32`): matches to **3e-5**; ~48% MULT util.
+- **conv1b** (Cin=64→64, 3×3, `conv_fp32_tiled`, 5 channel-groups): matches to
+  **1.9e-6**; ~66% MULT util.
+- `conv_fp32_tiled.asm` adds channel-group tiling (G≤14 channels/group, R_ACC
+  accumulates across groups) so any Cin (up to 256) runs; 35 words.
+- Remaining (same pattern): conv2a..conv4b, detector head (convPa/Pb + detect),
+  descriptor head (convDa/Db + L2-norm).
 
 ## Run
 ```
