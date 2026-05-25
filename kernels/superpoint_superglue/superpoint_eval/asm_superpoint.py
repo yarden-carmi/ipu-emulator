@@ -56,14 +56,26 @@ def main():
     img = (rng.standard_normal((H, Wd)).astype(np.float32) * 0.3)
     print(f"=== SuperPoint detector path: .asm vs torch, image {H}x{Wd} ===")
 
-    # ---- .asm forward ----
-    x = img[None]                         # (1,H,W)
-    x = asm_conv(x, "conv1a"); x = asm_conv(x, "conv1b"); x = maxpool2(x)
-    x = asm_conv(x, "conv2a"); x = asm_conv(x, "conv2b"); x = maxpool2(x)
-    x = asm_conv(x, "conv3a"); x = asm_conv(x, "conv3b"); x = maxpool2(x)
-    x = asm_conv(x, "conv4a"); x = asm_conv(x, "conv4b")
-    cPa = asm_conv(x, "convPa")
-    semi_asm = asm_conv(cPa, "convPb", relu=False)     # (65, Hc, Wc)
+    # ---- chained asm + numpy ref together, per-layer diff ----
+    def C_ref(layer, t, relu=True):
+        w, b = wload(layer)
+        if w.shape[2] == 1:
+            w33 = np.zeros((w.shape[0], w.shape[1], 3, 3), np.float32)
+            w33[:, :, 1, 1] = w[:, :, 0, 0]; w = w33
+        return modified_ops.conv2d_relu(t, w, b, relu=relu)
+    xa = img[None]; xr = img[None]
+    plan = [("conv1a",1,0),("conv1b",1,1),("conv2a",0,0),("conv2b",0,1),
+            ("conv3a",0,0),("conv3b",0,1),("conv4a",0,0),("conv4b",0,0),
+            ("convPa",0,0),("convPb",0,1)]   # (layer, _, pool_after)
+    for layer, _, pool in plan:
+        relu = (layer != "convPb")
+        xa = asm_conv(xa, layer, relu=relu)
+        xr = C_ref(layer, xr, relu=relu)
+        d = np.abs(xa - xr[:, :, :xa.shape[2]])
+        print(f"  {layer:8} shape={tuple(xa.shape)}  max_abs_diff={d.max():.2e}  mean={d.mean():.2e}")
+        if pool:
+            xa = maxpool2(xa); xr = maxpool2(xr)
+    semi_asm = xa
 
     # ---- numpy reference (true SuperPoint conv+bias+relu math) ----
     try:
