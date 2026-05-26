@@ -66,7 +66,7 @@ def main():
     xa = img[None]; xr = img[None]
     plan = [("conv1a",1,0),("conv1b",1,1),("conv2a",0,0),("conv2b",0,1),
             ("conv3a",0,0),("conv3b",0,1),("conv4a",0,0),("conv4b",0,0),
-            ("convPa",0,0),("convPb",0,1)]   # (layer, _, pool_after)
+            ("convPa",0,0),("convPb",0,0)]   # (layer, _, pool_after)
     for layer, _, pool in plan:
         relu = (layer != "convPb")
         xa = asm_conv(xa, layer, relu=relu)
