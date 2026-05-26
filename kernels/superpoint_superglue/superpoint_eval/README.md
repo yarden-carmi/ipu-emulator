@@ -51,8 +51,10 @@ stitched.
 | conv1a | 480×640 | 1→64 | 5.7e-6 | 49 | ~6.8 M |
 | conv4a | 60×80 | 128→128 | 3.1e-5 | 66 | ~15.0 M |
 | convPa | 60×80 | 128→256 | 1.4e-6 | 66 | ~29.9 M |
+| convPb (1×1) | 60×80 | 256→65 | 9.5e-6 | 66 | ~16.5 M |
 
-All match. (conv1a's activation fits XMEM; conv4a/convPa need H-banding.)
+All match. (conv1a's activation fits XMEM; deeper layers need H-banding.) convPb
+is a 1×1 conv run on the 3×3 kernel with center-only weights.
 
 Kernels used: `conv_fp32` (Cin≤13), `conv_fp32_tiled` (channel-group tiling, any
 Cin; ReLU), `conv_fp32_tiled_norelu` (convPb/convDb), `superpoint_detect`
