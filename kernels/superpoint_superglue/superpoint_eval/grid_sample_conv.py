@@ -140,6 +140,7 @@ BKPT ;;
                   (6, Hc), (7, Wc), (8, MH), (9, OUT), (10, H)]:
         s.regfile.set_cr(cr, v)
     load_program(s, list(prog)); run_until_complete(s, max_cycles=5_000_000)
+    ipu_bilinear_matmul.cycles = s.stats.total_cycles
     out = np.zeros((H, W), np.float32)
     for y in range(H):
         d = s.xmem.read_address(OUT + y * 512, 512)
@@ -205,6 +206,7 @@ BKPT ;;
                   (7, 0x50000), (8, 0x60000), (9, 0x70000), (10, OUT), (11, 512), (12, H)]:
         s.regfile.set_cr(cr, v)
     load_program(s, list(prog)); run_until_complete(s, max_cycles=2_000_000)
+    ipu_bilinear.cycles = s.stats.total_cycles
     out = np.zeros((H, W), np.float32)
     for y in range(H):
         d = s.xmem.read_address(OUT + y * 512, 512)
@@ -235,8 +237,9 @@ if __name__ == "__main__":
     o2 = ipu_bilinear(C2, Hc2, Wc2, H2, W2)
     d2 = np.abs(o2 - r2)
     print(f"  IPU 4-corner accumulate ({Hc2}x{Wc2}->{H2}x{W2}, 1ch): max {d2.max():.2e} "
-          f"{'MATCH' if d2.max() < 1e-3 else 'FAIL'}  (host builds gathered corner fields)")
+          f"{'MATCH' if d2.max() < 1e-3 else 'FAIL'}  {ipu_bilinear.cycles} cyc (host builds gathered corners)")
     o3 = ipu_bilinear_matmul(C2, Hc2, Wc2, H2, W2)
     d3 = np.abs(o3 - r2)
     print(f"  IPU gather-free matmul  ({Hc2}x{Wc2}->{H2}x{W2}, 1ch): max {d3.max():.2e} "
-          f"{'MATCH' if d3.max() < 1e-3 else 'FAIL'}  (host-free at run: precomputed Mh,Mw)")
+          f"{'MATCH' if d3.max() < 1e-3 else 'FAIL'}  {ipu_bilinear_matmul.cycles} cyc (host-free at run)")
+    print(f"  cycle ratio (matmul / 4-corner): {ipu_bilinear_matmul.cycles / ipu_bilinear.cycles:.1f}x")
