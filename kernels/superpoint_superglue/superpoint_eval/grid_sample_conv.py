@@ -128,7 +128,8 @@ BKPT ;;
     reset_labels(); prog = [decode_instruction_word(w) for w in assemble(asm)]
     s = IpuState(wide_vector_debug=True, wide_vector_arithmetic=WideVectorArithmetic.FP32)
     s.regfile.set_cr(15, DType.INT8)
-    COARSE, BW, TCOL, MH, OUT = 0x0, 0x10000, 0x20000, 0x30000, 0x40000
+    RS = ((max(H, Hc, Wc) * 512 + 0xFFFF) // 0x10000) * 0x10000   # per-region stride
+    COARSE, BW, TCOL, MH, OUT = 0, RS, 2 * RS, 3 * RS, 4 * RS
     def wr(base, row, n):
         v = [0.0] * 128
         for x in range(n): v[x] = float(row[x])
@@ -196,12 +197,14 @@ BKPT ;;
             row = [0.0] * 128
             for x in range(W): row[x] = float(fld[y, x])
             s.xmem.write_address(base + y * 512, struct.pack("<128f", *row))
-    # corner value fields at cr2/4/6/8, weight fields at cr3/5/7/9, out at cr10
-    addrs = {(0, 0): (0x0, 0x10000), (0, 1): (0x20000, 0x30000),
-             (1, 0): (0x40000, 0x50000), (1, 1): (0x60000, 0x70000)}
+    # corner value fields + weight fields (each H rows), then output -- 9 H-row
+    # regions stacked at an H-scaled stride so larger H stays in bounds.
+    RS = ((H * 512 + 0xFFFF) // 0x10000) * 0x10000
+    addrs = {(0, 0): (0 * RS, 1 * RS), (0, 1): (2 * RS, 3 * RS),
+             (1, 0): (4 * RS, 5 * RS), (1, 1): (6 * RS, 7 * RS)}
     for k, (va, wa) in addrs.items():
         wr(va, corners[k]); wr(wa, Wd[k])
-    OUT = 0x100000
+    OUT = 8 * RS
     for cr, v in [(2, 0x0), (3, 0x10000), (4, 0x20000), (5, 0x30000), (6, 0x40000),
                   (7, 0x50000), (8, 0x60000), (9, 0x70000), (10, OUT), (11, 512), (12, H)]:
         s.regfile.set_cr(cr, v)
@@ -243,3 +246,18 @@ if __name__ == "__main__":
     print(f"  IPU gather-free matmul  ({Hc2}x{Wc2}->{H2}x{W2}, 1ch): max {d3.max():.2e} "
           f"{'MATCH' if d3.max() < 1e-3 else 'FAIL'}  {ipu_bilinear_matmul.cycles} cyc (host-free at run)")
     print(f"  cycle ratio (matmul / 4-corner): {ipu_bilinear_matmul.cycles / ipu_bilinear.cycles:.1f}x")
+
+    # ---- real descriptor size: coarse 60x80 -> 480x640, 256 channels ----
+    # cycles depend only on loop trip counts (Hc,Wc,H,W_tile), not weight values,
+    # so run one (channel, 128-col tile) at the real Hc/Wc/H and scale by
+    # CH=256 channels x TILES=ceil(640/128)=5 column tiles.
+    CH, TILES = 256, 5
+    Cr = rng.standard_normal((1, 60, 80)).astype(np.float32)
+    ipu_bilinear_matmul(Cr, 60, 80, 480, 128)                 # H=480 fits XMEM
+    mm = ipu_bilinear_matmul.cycles
+    ipu_bilinear(Cr, 60, 80, 240, 128)                        # H=240 (9 fields fit)
+    fc = ipu_bilinear.cycles * 2                              # linear in H -> H=480
+    print(f"\n  real descriptor size 60x80 -> 480x640, {CH} channels ({TILES} col-tiles):")
+    print(f"    4-corner : {fc:>9,} cyc/(ch,tile)  ->  {fc*CH*TILES:>14,} cyc total  (host pre-gathers)")
+    print(f"    matmul   : {mm:>9,} cyc/(ch,tile)  ->  {mm*CH*TILES:>14,} cyc total  (host-free)")
+    print(f"    ratio matmul/4-corner: {mm/fc:.1f}x")
