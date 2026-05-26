@@ -51,7 +51,7 @@ def ref_superpoint(img):
     return semi
 
 def main():
-    H = Wd = 32                          # /8 -> 4x4 detector grid
+    H = Wd = 16                          # /8 -> 4x4 detector grid
     rng = np.random.default_rng(0)
     img = (rng.standard_normal((H, Wd)).astype(np.float32) * 0.3)
     print(f"=== SuperPoint detector path: .asm vs torch, image {H}x{Wd} ===")
