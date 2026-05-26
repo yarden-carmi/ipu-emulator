@@ -46,6 +46,26 @@ def bilinear_ref(C, Hc, Wc, H, W):
         out += C[:, np.clip(II + dy, 0, Hc - 1), np.clip(JJ + dx, 0, Wc - 1)] * w[None]
     return out
 
+def interp_matrices(Hc, Wc, H, W):
+    """Precomputed 1D bilinear interpolation matrices Mh (HxHc), Mw (WxWc) for the
+    fixed-resolution align_corners mapping. grid_sample is separable on a regular
+    grid, so out = Mh @ coarse @ Mw.T (per channel). Each row of Mh/Mw has exactly
+    two nonzeros (the bilinear pair) -- DATA-INDEPENDENT, computed once."""
+    cx = (np.arange(W) / (W / 2.0) - 1.0 + 1.0) / 2.0 * (Wc - 1)
+    cy = (np.arange(H) / (H / 2.0) - 1.0 + 1.0) / 2.0 * (Hc - 1)
+    jj = np.clip(np.floor(cx).astype(int), 0, Wc - 2); fx = cx - jj
+    ii = np.clip(np.floor(cy).astype(int), 0, Hc - 2); fy = cy - ii
+    Mw = np.zeros((W, Wc), np.float32)
+    Mh = np.zeros((H, Hc), np.float32)
+    for X in range(W): Mw[X, jj[X]] += 1 - fx[X]; Mw[X, jj[X] + 1] += fx[X]
+    for Y in range(H): Mh[Y, ii[Y]] += 1 - fy[Y]; Mh[Y, ii[Y] + 1] += fy[Y]
+    return Mh, Mw
+
+def matmul_ref(C, Hc, Wc, H, W):
+    """grid_sample as two matmuls by the precomputed constant matrices."""
+    Mh, Mw = interp_matrices(Hc, Wc, H, W)
+    return np.stack([Mh @ C[c] @ Mw.T for c in range(C.shape[0])])
+
 def torch_grid_sample(C, H, W):
     import torch, torch.nn.functional as F
     gx = (np.arange(W) / (W / 2.0) - 1.0).astype(np.float32)   # (W,)
@@ -56,6 +76,75 @@ def torch_grid_sample(C, H, W):
     grid = torch.from_numpy(grid)[None]                        # (1,H,W,2)
     t = F.grid_sample(torch.from_numpy(C)[None], grid, mode="bilinear", align_corners=True)
     return t[0].numpy()
+
+# -------- IPU: GATHER-FREE separable matmul (precomputed interp matrices) ------
+def ipu_bilinear_matmul(C, Hc, Wc, H, W):
+    """Run the FULLY ON-DEVICE gather-free grid_sample: out = Mh @ coarse @ Mw.T,
+    two matmuls by the precomputed constant interpolation matrices (no host gather
+    -- the column/row resample stays lane-aligned via MULT.VE.CYCLIC scalar-from-R0
+    times a precomputed basis row in R_CYCLIC, accumulated). W<=128, 1 channel.
+
+    Stage 1 (column resample): Tcol[ic] = sum_jc coarse[ic,jc] * Mw[:,jc]  (W lanes).
+    Stage 2 (row resample):    out[Y]   = sum_ic Mh[Y,ic]    * Tcol[ic]    (W lanes).
+    Both are the matmul MAC pattern: scalar (R0[idx]) x precomputed basis (R_CYCLIC),
+    producing lane-aligned output rows -- no gather, no scatter, host-free at run."""
+    sys.path.insert(0, HERE)
+    from ipu_emu.emulator import load_program, run_until_complete
+    from ipu_emu.execute import decode_instruction_word
+    from ipu_emu.ipu_state import IpuState, WideVectorArithmetic
+    from ipu_emu.ipu_math import DType
+    from ipu_as.lark_tree import assemble
+    from ipu_as.label import reset_labels
+    assert W <= 128 and C.shape[0] == 1
+    Mh, Mw = interp_matrices(Hc, Wc, H, W)
+    asm = """\
+SET lr10 cr0 ;;
+SET lr0 cr0 ;; SET lr1 cr0 ;; SET lr2 cr0 ;;
+s1_row:
+LDR_MULT_REG r0 lr1 cr3 ;;
+RESET_ACC ;;
+SET lr3 cr0 ;; SET lr4 cr0 ;; SET lr5 cr0 ;;
+s1_col:
+LDR_CYCLIC_MULT_REG lr4 cr4 lr10 ; MULT.VE.CYCLIC lr10 0 lr10 lr5 ; ACC ;;
+ADD lr4 lr4 cr2 ; ADD lr5 lr5 cr1 ; ADD lr3 lr3 cr1 ;;
+BLT lr3 cr7 s1_col ;;
+STR_ACC_REG lr2 cr5 ;;
+ADD lr1 lr1 cr2 ; ADD lr2 lr2 cr2 ; ADD lr0 lr0 cr1 ;;
+BLT lr0 cr6 s1_row ;;
+SET lr0 cr0 ;; SET lr1 cr0 ;; SET lr2 cr0 ;;
+s2_row:
+LDR_MULT_REG r0 lr1 cr8 ;;
+RESET_ACC ;;
+SET lr3 cr0 ;; SET lr4 cr0 ;; SET lr5 cr0 ;;
+s2_col:
+LDR_CYCLIC_MULT_REG lr4 cr5 lr10 ; MULT.VE.CYCLIC lr10 0 lr10 lr5 ; ACC ;;
+ADD lr4 lr4 cr2 ; ADD lr5 lr5 cr1 ; ADD lr3 lr3 cr1 ;;
+BLT lr3 cr6 s2_col ;;
+STR_ACC_REG lr2 cr9 ;;
+ADD lr1 lr1 cr2 ; ADD lr2 lr2 cr2 ; ADD lr0 lr0 cr1 ;;
+BLT lr0 cr10 s2_row ;;
+BKPT ;;
+"""
+    reset_labels(); prog = [decode_instruction_word(w) for w in assemble(asm)]
+    s = IpuState(wide_vector_debug=True, wide_vector_arithmetic=WideVectorArithmetic.FP32)
+    s.regfile.set_cr(15, DType.INT8)
+    COARSE, BW, TCOL, MH, OUT = 0x0, 0x10000, 0x20000, 0x30000, 0x40000
+    def wr(base, row, n):
+        v = [0.0] * 128
+        for x in range(n): v[x] = float(row[x])
+        s.xmem.write_address(base, struct.pack("<128f", *v))
+    for ic in range(Hc): wr(COARSE + ic * 512, C[0, ic], Wc)   # coarse rows (Wc lanes)
+    for jc in range(Wc): wr(BW + jc * 512, Mw[:, jc], W)        # Mw column-basis (W lanes)
+    for Y in range(H):  wr(MH + Y * 512, Mh[Y], Hc)            # Mh rows (Hc lanes)
+    for cr, v in [(0, 0), (1, 1), (2, 512), (3, COARSE), (4, BW), (5, TCOL),
+                  (6, Hc), (7, Wc), (8, MH), (9, OUT), (10, H)]:
+        s.regfile.set_cr(cr, v)
+    load_program(s, list(prog)); run_until_complete(s, max_cycles=5_000_000)
+    out = np.zeros((H, W), np.float32)
+    for y in range(H):
+        d = s.xmem.read_address(OUT + y * 512, 512)
+        for x in range(W): out[y, x] = struct.unpack_from("<f", d, x * 4)[0]
+    return out
 
 # ---------------- IPU: 4-corner weighted accumulate (MULT.EE + ACC) ----------
 def ipu_bilinear(C, Hc, Wc, H, W):
@@ -134,13 +223,20 @@ if __name__ == "__main__":
         d = np.abs(ref - t)
         print(f"  precomputed-conv form vs torch grid_sample: max {d.max():.2e} mean {d.mean():.2e} "
               f"{'MATCH' if d.max() < 1e-4 else 'DIFF'}")
+        dm = np.abs(matmul_ref(C, Hc, Wc, H, W) - t)
+        print(f"  separable matmul form vs torch grid_sample: max {dm.max():.2e} "
+              f"{'MATCH' if dm.max() < 1e-4 else 'DIFF'}")
     except Exception as e:
         print("  torch check skipped:", e)
-    # IPU run (small: 1ch, W<=128)
+    # IPU runs (small: 1ch, W<=128)
     Hc2, Wc2, H2, W2 = 16, 16, 64, 100
     C2 = rng.standard_normal((1, Hc2, Wc2)).astype(np.float32)
     r2 = bilinear_ref(C2, Hc2, Wc2, H2, W2)[0]
     o2 = ipu_bilinear(C2, Hc2, Wc2, H2, W2)
     d2 = np.abs(o2 - r2)
     print(f"  IPU 4-corner accumulate ({Hc2}x{Wc2}->{H2}x{W2}, 1ch): max {d2.max():.2e} "
-          f"{'MATCH' if d2.max() < 1e-3 else 'FAIL'}")
+          f"{'MATCH' if d2.max() < 1e-3 else 'FAIL'}  (host builds gathered corner fields)")
+    o3 = ipu_bilinear_matmul(C2, Hc2, Wc2, H2, W2)
+    d3 = np.abs(o3 - r2)
+    print(f"  IPU gather-free matmul  ({Hc2}x{Wc2}->{H2}x{W2}, 1ch): max {d3.max():.2e} "
+          f"{'MATCH' if d3.max() < 1e-3 else 'FAIL'}  (host-free at run: precomputed Mh,Mw)")
