@@ -17,20 +17,33 @@
 // full width and all band rows for one channel per launch -- only band
 // streaming + one launch/channel remain on the host, no width work/stitching.
 //
+// TIGHT INPUT PACKING: input rows use a tight stride RW_in=(W+2)*4 (no rounding
+// to whole 128-lane tiles) -> the resident input has no column padding, ~16-40%
+// smaller, so a streamed band holds more rows. Output stays 512-tile-aligned
+// (STR writes 512B), row stride RW_out=num_col_tiles*512. The last column-tile's
+// 128-lane read spills past the packed input row into the next row but only
+// affects output cols >= W (in the output's padding tile, never read); add ONE
+// guard input row at the band end so the last row's spill stays in bounds.
+// Caveat: valid for per-layer eval (host lays out tight input); a chained
+// pipeline keeps 512-padded I/O (store granularity) unless the host re-packs.
+//
 // Register / memory contract:
 //   CR0=0, CR1=1
-//   CR2=IN, CR3=OUT, CR4=in_chan_stride (Hp*RW), CR5=RW (in/out row stride),
-//   CR6=H (band rows), CR7=512 (col-tile stride), CR8=RW-8 (tap row-wrap),
+//   CR2=IN, CR3=OUT, CR4=in_chan_stride (Hp*RW_in), CR5=RW_in ((W+2)*4, tight),
+//   CR6=H (band rows), CR7=512 (col-tile stride), CR8=RW_out (num_col_tiles*512),
 //   CR9=weights_base, CR10=128, CR11=G, CR12=ngroups, CR13=group_weight_stride,
-//   CR14=num_col_tiles, CR15=dtype.
-//   Input planes Ctot (=padded Cin'+ones) at IN+ci*in_chan_stride, full-width rows.
-//   Output plane: H rows x RW bytes, valid cols 0..W-1.
+//   CR14=num_col_tiles, CR15=dtype.  (tap row-wrap RW_in-8 computed into lr14.)
+//   Input planes Ctot at IN+ci*in_chan_stride, tight RW_in-wide rows (+1 guard row).
+//   Output plane: H rows x RW_out bytes, valid cols 0..W-1.
 // ============================================================================
 
     SET                 lr15 cr10 ;;        // 128 (valid lanes for relu)
     SET                 lr0 cr0 ;;           // 0
-    SET                 lr1 cr0 ;;           // row byte offset = 0
+    SET                 lr1 cr0 ;;           // INPUT row byte offset = 0 (stride RW_in=CR5)
     SET                 lr2 cr0 ;;           // row counter = 0
+    SET                 lr13 cr0 ;;          // OUTPUT row byte offset = 0 (stride RW_out=CR8)
+    SET                 lr14 cr5 ;;
+    SUB                 lr14 lr14 8 ;;       // lr14 = RW_in - 8 (tap row-wrap delta)
 
 row_loop:
     SET                 lr8 cr0 ;;           // col-tile counter = 0
@@ -55,10 +68,10 @@ cin_loop:
     ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
-    ADD lr6 lr6 cr8 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
+    ADD lr6 lr6 lr14 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
-    ADD lr6 lr6 cr8 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
+    ADD lr6 lr6 lr14 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD lr6 lr6 4 ; ADD lr4 lr4 1 ; LDR_CYCLIC_MULT_REG lr6 cr0 lr0 ; MULT.VE.CYCLIC lr0 0 lr0 lr4 ; ACC ;;
     ADD                 lr3 lr3 cr4 ;;       // next input channel plane
@@ -69,13 +82,14 @@ cin_loop:
     BLT                 lr10 cr12 group_loop ;;
 
     ACTIVATE            lr15 relu ;;
-    ADD                 lr11 lr1 lr9 ;;      // out offset = row + col-tile
+    ADD                 lr11 lr13 lr9 ;;     // out offset = OUTPUT row (RW_out) + col-tile
     STR_POST_AAQ_REG    lr11 cr3 ;;
     ADD                 lr9 lr9 cr7 ;;       // next col-tile (+512)
     ADD                 lr8 lr8 cr1 ;;
     BLT                 lr8 cr14 coltile_loop ;;
 
-    ADD                 lr1 lr1 cr5 ;;       // next row (+RW)
+    ADD                 lr1 lr1 cr5 ;;       // next INPUT row (+RW_in)
+    ADD                 lr13 lr13 cr8 ;;     // next OUTPUT row (+RW_out)
     ADD                 lr2 lr2 cr1 ;;
     BLT                 lr2 cr6 row_loop ;;
 
