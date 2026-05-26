@@ -38,6 +38,22 @@ SuperPoint's softmax argmax **100%** of the time (softmax is monotonic, so
 `argmax(softmax)=argmax(logits)`), so the selected keypoint per cell is identical;
 the fixed-threshold top-k then operates on matching logits.
 
+## Real-resolution, one kernel at a time (`real_res.py`)
+
+Each conv kernel run at its **true SuperPoint spatial size** vs the reference.
+Wide layers are width-tiled (≤126-col strips + halo) and tall/deep layers are
+H-banded (row bands so the 128–256-channel activation fits the 2 MB XMEM — the
+streaming the cache unit does on hardware); no kernel changes, interior outputs
+stitched.
+
+| layer | real res | Cin→Cout | max diff | MULT% | full-layer cycles |
+|-------|----------|----------|---------:|------:|------------------:|
+| conv1a | 480×640 | 1→64 | 5.7e-6 | 49 | ~6.8 M |
+| conv4a | 60×80 | 128→128 | 3.1e-5 | 66 | ~15.0 M |
+| convPa | 60×80 | 128→256 | 1.4e-6 | 66 | ~29.9 M |
+
+All match. (conv1a's activation fits XMEM; conv4a/convPa need H-banding.)
+
 Kernels used: `conv_fp32` (Cin≤13), `conv_fp32_tiled` (channel-group tiling, any
 Cin; ReLU), `conv_fp32_tiled_norelu` (convPb/convDb), `superpoint_detect`
 (max+threshold). 2×2/s2 maxpool is the one host step (stride-2 = a gather the ISA

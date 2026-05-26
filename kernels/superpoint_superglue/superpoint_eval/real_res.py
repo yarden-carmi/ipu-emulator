@@ -56,6 +56,8 @@ def conv_real(x, w, b, relu=True, chunk=124):
 def eval_layer(layer, Cout_lim=2, seed=0):
     H, Wd = RES[layer]
     w, b = wload(layer); Cout, Cin = w.shape[0], w.shape[1]
+    if w.shape[2] == 1:                              # 1x1 -> center-only 3x3 (both paths)
+        w33 = np.zeros((Cout, Cin, 3, 3), np.float32); w33[:, :, 1, 1] = w[:, :, 0, 0]; w = w33
     w, b = w[:Cout_lim], b[:Cout_lim]
     rng = np.random.default_rng(seed)
     x = (rng.standard_normal((Cin, H, Wd)).astype(np.float32) * 0.3)
