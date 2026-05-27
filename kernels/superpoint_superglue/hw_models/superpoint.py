@@ -28,6 +28,22 @@ from torch import nn
 LOG2E = 1.4426950408889634
 
 
+def hw_conv2d(x, weight, bias, pad: int):
+    """Direct convolution as the hardware computes it (conv_fp32_full.asm): a
+    sum over the k*k spatial taps, each a constant-offset shifted contiguous load
+    times a 1x1 weight (a per-tap channel MAC), accumulated in FP32 -- NOT
+    cuDNN's Winograd/FFT path. Zero border padding. weight:(Cout,Cin,kh,kw)."""
+    Cout, Cin, kh, kw = weight.shape
+    b, c, H, W = x.shape
+    xp = torch.nn.functional.pad(x, (pad, pad, pad, pad))         # zero border
+    out = bias.view(1, Cout, 1, 1).expand(b, Cout, H, W).clone()  # bias (ones-channel)
+    for dy in range(kh):
+        for dx in range(kw):                                      # tap = shifted load
+            tap = xp[:, :, dy:dy + H, dx:dx + W]
+            out = out + torch.einsum('oc,bchw->bohw', weight[:, :, dy, dx], tap)  # MAC + ACC
+    return out
+
+
 def maxpool_shift(x, kernel: int, stride: int, pad: int):
     """Window max as the hardware computes it (maxpool_shift.asm): a running
     element-wise max over the kernel*kernel shifted taps (each a constant-offset
@@ -159,14 +175,15 @@ class SuperPoint(nn.Module):
         print('Loaded SuperPoint model [hardware-faithful]')
 
     def forward(self, data):
+        cv = lambda t, conv, p=1: self.relu(hw_conv2d(t, conv.weight, conv.bias, p))  # direct MAC
         mp = lambda t: maxpool_shift(t, kernel=2, stride=2, pad=0)   # 2x2/s2 = max of 4 taps
-        x = self.relu(self.conv1a(data['image'])); x = self.relu(self.conv1b(x)); x = mp(x)
-        x = self.relu(self.conv2a(x)); x = self.relu(self.conv2b(x)); x = mp(x)
-        x = self.relu(self.conv3a(x)); x = self.relu(self.conv3b(x)); x = mp(x)
-        x = self.relu(self.conv4a(x)); x = self.relu(self.conv4b(x))
+        x = cv(data['image'], self.conv1a); x = cv(x, self.conv1b); x = mp(x)
+        x = cv(x, self.conv2a); x = cv(x, self.conv2b); x = mp(x)
+        x = cv(x, self.conv3a); x = cv(x, self.conv3b); x = mp(x)
+        x = cv(x, self.conv4a); x = cv(x, self.conv4b)
 
-        cPa = self.relu(self.convPa(x))
-        scores = self.convPb(cPa)
+        cPa = cv(x, self.convPa)
+        scores = hw_conv2d(cPa, self.convPb.weight, self.convPb.bias, 0)   # 1x1, no ReLU
         scores = exp2_softmax(scores, 1)[:, :-1]                 # softmax.asm (exp2)
         b, _, h, w = scores.shape
         scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)   # pixel_shuffle.asm
@@ -184,8 +201,8 @@ class SuperPoint(nn.Module):
                 for k, s in zip(keypoints, scores)]))
         keypoints = [torch.flip(k, [1]).float() for k in keypoints]
 
-        cDa = self.relu(self.convDa(x))
-        descriptors = self.convDb(cDa)
+        cDa = cv(x, self.convDa)
+        descriptors = hw_conv2d(cDa, self.convDb.weight, self.convDb.bias, 0)   # 1x1
         descriptors = l2_normalize(descriptors, 1)               # l2_normalize.asm (rsqrt)
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                        for k, d in zip(keypoints, descriptors)]
