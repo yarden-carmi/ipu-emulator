@@ -46,8 +46,8 @@ reduce a[0..n) -> scalar q (one VLIW op):
     q = (max_{i<n} a_i) * c           AGG max  value_cr
 
 activate a[0..n) -> p (post_aaq):
-    p_i = f(a_i),  f ∈ {relu, relu6, sigmoid, tanh, gelu, silu,
-                         softplus, elu, prelu, identity, exp2=2^x}   ACTIVATE
+    p_i = f(a_i),  f ∈ {identity, relu, relu6, sigmoid, tanh, gelu,
+                         softplus, elu, exp2=2^x}   ACTIVATE
 ```
 
 Two recurring tricks:
