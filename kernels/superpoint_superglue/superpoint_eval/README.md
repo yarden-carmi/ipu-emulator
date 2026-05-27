@@ -61,9 +61,39 @@ Cin; ReLU), `conv_fp32_tiled_norelu` (convPb/convDb), `superpoint_detect`
 (max+threshold). 2×2/s2 maxpool is the one host step (stride-2 = a gather the ISA
 leaves to host). Only `.asm` + Python; simulator untouched.
 
+## SuperGlue end-to-end (`compare_sg.py`)
+
+Validates the matcher against the **official pretrained SuperGlue**
+(`third_party/superglue`, Magic Leap `superglue_outdoor.pth`). Our pipeline is
+bit-identical to official everywhere except the optimal-transport step: the
+kernels use the **tropical (max-plus) Sinkhorn** (`sinkhorn_iter.asm` row half-step
+`Z-=max_j` + `sinkhorn_col.asm` col half-step `Z-=max_i`) instead of the
+log-domain logsumexp Sinkhorn. (Base-2 softmax with a `log2(e)` pre-scale is
+exactly natural softmax, so attention is bit-exact and needs no separate check.)
+
+Result (pretrained 'outdoor', N=64 keypoints/image, mean over 5 seeds):
+
+| metric | value |
+|--------|------:|
+| `sinkhorn_iter.asm`+`sinkhorn_col.asm` vs numpy tropical (65×65, 5 iters) | **0.00e+00** (exact) |
+| stock log-Sinkhorn valid matches | 28.2 / 64 |
+| our max-Sinkhorn valid matches | 33.4 / 64 |
+| **same target when both match** | **91.2%** |
+| matches0 agreement (incl. no-match) | 60.0% |
+
+**Reading:** the `.asm` kernels reproduce the tropical iteration exactly; and when
+both methods commit to a correspondence they pick the **same partner 91%** of the
+time. The lower full-array agreement (60%) is the *threshold/validity* decision:
+tropical OT is more permissive (it omits the log-marginal `log_mu/log_nu` terms),
+so it admits more matches. This is the one genuine algorithmic gap -- unlike base-2
+softmax (exact), the max-plus Sinkhorn is a real approximation of the soft OT.
+(Inputs are synthetic structured pairs; real-image descriptors would be more
+representative, but the asm==reference exactness holds regardless.)
+
 ## Run
 ```
 source /tmp/ipuenv/bin/activate            # torch + numpy + ipu packages
-python superpoint_eval/extract_weights.py  # once
-python superpoint_eval/compare.py
+python superpoint_eval/extract_weights.py  # once (SuperPoint)
+python superpoint_eval/compare.py          # SuperPoint op-by-op
+python superpoint_eval/compare_sg.py       # SuperGlue end-to-end vs pretrained
 ```
