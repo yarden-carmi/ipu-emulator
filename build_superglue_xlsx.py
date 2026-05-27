@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Build SuperGlue performance-model sheets in the MobileViT spreadsheet's style.
+"""Build SuperGlue performance-model sheets in the MobileViT spreadsheet's style,
+broken down to BARE OPERATIONS (one elementary vector op per row -- multiply,
+accumulate, max, sum, exp2, sub, recip, move, compare) so there are no hidden
+pass-count multipliers. A multiply-accumulate is two bare rows (multiply +
+accumulate); a softmax is max+sub+exp2+sum+mul; etc.  Adds an FPS cell.
 
-One sheet per variant: original SuperGlue + each of our 4 modifications isolated.
-Cells use the same column layout and formula conventions as the MobileViT sheet
-(Cycles = work/128 lanes, Time=Cycles/freq, BW = mem*8/Time). N=512 keypoints,
-D=256 descriptor dim, 4 heads (head_dim 64), 18 GNN layers (self/cross) over a
-pair of images, Sinkhorn T=100 on the (N+1)x(N+1) assignment matrix.
+Same column layout / formulas / formatting as the MobileViT sheet (theme fills,
+borders, coloured header, frozen panes, yellow/green section brackets, totals).
+N=512 keypoints, D=256, 4 heads (head_dim 64), 18 GNN self/cross layers over an
+image pair, Sinkhorn T=100 on the (N+1)x(N+1) assignment matrix.
 """
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -15,146 +18,172 @@ SRC = "/root/.claude/uploads/8c029b26-5a4c-4fdb-96ec-f1feb856d256/fa8d8c24-IPU_2
 OUT = "/home/user/ipu-emulator/IPU_2_SuperGlue.xlsx"
 
 N, D, HEADS, HD, NP1, T = 512, 256, 4, 64, 513, 100
-GNN_BLOCKS = 18 * 2          # 18 self/cross layers x 2 images
+GNN_BLOCKS = 18 * 2
 COLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 wb = openpyxl.load_workbook(SRC)
 mob = wb["MobileViT"]
-HEADER = [mob.cell(1, c).value for c in range(1, 27)]   # A1..Z1
+HEADER = [mob.cell(1, c).value for c in range(1, 27)]
+
+
+def cstyle(dst, src):
+    dst.font = copy(src.font); dst.fill = copy(src.fill); dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment); dst.number_format = src.number_format
 
 
 def make_sheet(name):
     ws = wb.create_sheet(name)
     for c in range(1, 27):
-        ws.cell(1, c, HEADER[c - 1])
-        ws.cell(1, c).font = copy(mob.cell(1, c).font)
-    for col, w in [("A", 30), ("B", 22), ("C", 5), ("D", 6), ("E", 6), ("Y", 30), ("Z", 22)]:
-        ws.column_dimensions[col].width = w
-    ws["Y2"], ws["Z2"] = 1, 8          # freq GHz, Mem BW (same as MobileViT)
+        ws.cell(1, c, HEADER[c - 1]); cstyle(ws.cell(1, c), mob.cell(1, c))
+    for i in range(1, 27):
+        L = get_column_letter(i)
+        ws.column_dimensions[L].width = mob.column_dimensions[L].width
+    ws.freeze_panes = "B2"
+    ws["Y2"], ws["Z2"] = 1, 8
     return ws
 
 
-# cycle-formula families (templates use {r} = row number) -----------------------
-def cyc(kind, r):
-    f = {
-        "linear":  f"=C{r}*D{r}*G{r}/128",            # Cin*N*Cout
-        "mm2":     f"=(C{r}*D{r}*G{r}/128)*2",         # GEMM (mul+add)
-        "mmv":     f"=C{r}*D{r}*F{r}/128",             # attn @ V
-        "scale":   f"=C{r}*D{r}/128",
-        "softmax": f"=C{r}*D{r}*5/128",                # max,sub,exp,sum,div
-        "resid":   f"=C{r}*D{r}/128",
-        "reshape": "0",
-        "norm5":   f"=C{r}*D{r}*5/128",                # log-domain logsumexp norm
-        "norm2":   f"=C{r}*D{r}*2/128",                # plain sum+scale norm
-        "transp":  f"=C{r}*D{r}/128",
-        "pass1":   f"=C{r}*D{r}/128",                  # single-pass max/threshold
-    }
-    return f[kind]
-
-
-def emit(ws, r, layer, typ, c, d, e, f, g, h, i, j, k, l, m, n, kind, note=None, ynote=None):
-    vals = {"A": layer, "B": typ, "C": c, "D": d, "E": e, "F": f, "G": g, "H": h,
-            "I": i, "J": j, "K": k, "L": l, "M": m, "N": n,
-            "O": f"=C{r}*D{r}/1024", "P": f"=F{r}*G{r}/1024", "Q": 0,
-            "R": f"=L{r}*M{r}/1024", "S": cyc(kind, r)}
+# bare-op row: kind 'mac' -> S=C*D*G/128 (one of mul/add); 'ew' -> S=C*D/128; 'reshape' -> 0
+def emit(ws, r, group, op, c, d, g, kind):
+    S = {"mac": f"=C{r}*D{r}*G{r}/128", "ew": f"=C{r}*D{r}/128", "reshape": "0"}[kind]
+    vals = {"A": group, "B": op, "C": c, "D": d, "E": 0, "F": 0, "G": g, "H": 0,
+            "I": 0, "J": 0, "K": 0, "L": c, "M": d, "N": 0,
+            "O": f"=C{r}*D{r}/1024", "P": 0, "Q": 0, "R": f"=L{r}*M{r}/1024", "S": S}
     if kind == "reshape":
-        vals["S"] = "0"
-        vals["T"] = 0
-        for cc in "UVWX":
-            vals[cc] = 0
+        vals["S"] = "0"; vals["T"] = 0
+        for cc in "UVWX": vals[cc] = 0
     else:
         vals["T"] = f"=(S{r}/$Y$2)/1000"
-        vals["U"] = f"=((O{r}*8*1024)/$T{r})/1000"
-        vals["V"] = f"=((P{r}*8*1024)/$T{r})/1000"
-        vals["W"] = f"=((Q{r}*8*1024)/$T{r})/1000"
-        vals["X"] = f"=((R{r}*8*1024)/$T{r})/1000"
+        for cc, src in [("U", "O"), ("V", "P"), ("W", "Q"), ("X", "R")]:
+            vals[cc] = f"=(({src}{r}*8*1024)/$T{r})/1000"
     for col, v in vals.items():
-        ws.cell(r, COLS.index(col) + 1, v)
-    if ynote:
-        ws.cell(r, 25, ynote)        # col Y label
+        cstyle(ws.cell(r, COLS.index(col) + 1, v), mob.cell(5, COLS.index(col) + 1))
     return r + 1
 
 
+def bracket(ws, r0, r1, text, theme_cell):
+    ws.merge_cells(start_row=r0, start_column=27, end_row=r1, end_column=27)
+    c = ws.cell(r0, 27, text); cstyle(c, theme_cell); c.alignment = copy(theme_cell.alignment)
+
+
+def total(ws, r, label, zformula):
+    cstyle(ws.cell(r, 25, label), mob.cell(68, 25))
+    cstyle(ws.cell(r, 26, zformula), mob.cell(68, 26))
+
+
+YTAG, AATAG = mob.cell(5, 25), mob.cell(27, 27)
+
+# bare-op recipes (return list of (op_name, c, d, g, kind)) ----------------------
+def mac(c, d, K):                       # out (c x d) elems, contraction K -> mul + add
+    return [("multiply", c, d, K, "mac"), ("accumulate", c, d, K, "mac")]
+
+def ew(name, c, d):
+    return [(name, c, d, 0, "ew")]
+
+
 def build(ws, variant):
-    """variant in {'original','max_sinkhorn','base2_softmax','transpose_free','fixed_thresh'}."""
     r = 2
-    # ---- Keypoint encoder (per image; x2) ----  (Y2/Z2 hold freq/MemBW -- never label row 2)
-    r = emit(ws, r, "Input (kpt+desc)", "Model input", D, N, 1, 0, 0, 0, 0, 0, 0, D, N, 1, "reshape")
+    r = emit(ws, r, "Input", "kpt+desc load", D, N, 0, "reshape")
+
+    # ---- Keypoint encoder (MLP 3->32->64->128->256), x2 images ----
+    enc0 = r
     for cin, cout in [(3, 32), (32, 64), (64, 128), (128, 256)]:
-        r = emit(ws, r, "MLP + BN + ReLU", f"KptEnc {cin}->{cout}", cin, N, cin, cin, cout, cout, cout, 0, 0, cout, N, cout, "linear")
-    enc_total = r
-    r = emit(ws, r, "Residual", "desc += enc(kpt)", D, N, 0, D, N, 0, 0, 0, 0, D, N, 0, "resid", ynote="2X (two images)")
-    ws.cell(enc_total - 4, 26, f"=2*(SUM(T{enc_total-4}:T{enc_total}))")  # encoder total (col Z)
-    ws.cell(enc_total - 4, 25, "Encoder total [us] ->")
+        for op, c, d, g, k in mac(cout, N, cin):
+            r = emit(ws, r, f"KptEnc {cin}->{cout}", op, c, d, g, k)
+    for op, c, d in [("add", D, N)]:
+        r = emit(ws, r, "Residual desc+=enc", op, c, d, 0, "ew")
+    enc_end = r - 1
+    bracket(ws, enc0, enc_end, "Keypoint Encoder (x2 images)", YTAG)
+    total(ws, enc_end, "Encoder total [us] ->", f"=2*(SUM(T{enc0}:T{enc_end}))")
+    z_enc = enc_end
 
-    # ---- One GNN attention block (expanded; x GNN_BLOCKS) ----
+    # ---- One GNN attention block (expanded; heads x4; block x36) ----
     blk0 = r
-    r = emit(ws, r, "Projection", "Q proj (D->D)", D, N, 0, D, D, D, 0, 0, 0, D, N, 0, "linear",
-             ynote=f"GNN block (x{GNN_BLOCKS}=18 layers x 2 img)")
-    r = emit(ws, r, "Projection", "K proj (D->D)", D, N, 0, D, D, D, 0, 0, 0, D, N, 0, "linear")
-    r = emit(ws, r, "Projection", "V proj (D->D)", D, N, 0, D, D, D, 0, 0, 0, D, N, 0, "linear")
-    r = emit(ws, r, "Reshape", "head reshape Q", D, N, 0, 0, 0, 0, 0, 0, 0, HD, N, HEADS, "reshape")
-    r = emit(ws, r, "Reshape", "head reshape K", D, N, 0, 0, 0, 0, 0, 0, 0, HD, N, HEADS, "reshape")
-    r = emit(ws, r, "Reshape", "head reshape V", D, N, 0, 0, 0, 0, 0, 0, 0, HD, N, HEADS, "reshape")
-    r_qkt = r
-    r = emit(ws, r, "Mat mul", "QKt (1 head)", HD, N, 0, HD, N, 0, 0, 0, 0, N, N, 0, "mm2", ynote="4X (heads)")
-    r_sc = r
-    r = emit(ws, r, "Scaling", "1/sqrt(d)", N, N, 0, 0, 0, 0, 0, 0, 0, N, N, 0, "scale")
-    r_sm = r
-    sm_kind = "softmax"
-    r = emit(ws, r, "Softmax", "attn softmax" + (" (exp2)" if variant == "base2_softmax" else ""),
-             N, N, 0, 0, 0, 0, 0, 0, 0, N, N, 0, sm_kind)
-    r_qkv = r
-    r = emit(ws, r, "Mat mul", "attn @ V (1 head)", N, N, 0, HD, N, 0, 0, 0, 0, N, HD, 0, "mmv")
-    r = emit(ws, r, "Reshape", "concat heads", HD, N, HEADS, 0, 0, 0, 0, 0, 0, D, N, 0, "reshape",
-             ynote="total 4 heads [us]")
-    ws.cell(r - 1, 26, f"=4*(T{r_qkt}+T{r_sc}+T{r_sm}+T{r_qkv})")
-    r = emit(ws, r, "Mat mul", "out proj (D->D)", D, N, 0, D, D, D, 0, 0, 0, D, N, 0, "linear")
-    r = emit(ws, r, "Residual", "x += message", D, N, 0, D, N, 0, 0, 0, 0, D, N, 0, "resid")
-    r = emit(ws, r, "Mat mul + ReLU", "merge MLP 2D->2D", 2 * D, N, 0, 2 * D, 2 * D, 2 * D, 0, 0, 0, 2 * D, N, 0, "linear")
-    r = emit(ws, r, "Mat mul", "merge MLP 2D->D", 2 * D, N, 0, 2 * D, D, D, 0, 0, 0, D, N, 0, "linear")
-    r = emit(ws, r, "Residual", "x += mlp", D, N, 0, D, N, 0, 0, 0, 0, D, N, 0, "resid")
+    for nm in ("Q", "K", "V"):
+        for op, c, d, g, k in mac(D, N, D):
+            r = emit(ws, r, f"{nm} proj D->D", op, c, d, g, k)
+    for nm in "QKV":
+        r = emit(ws, r, f"head reshape {nm}", "reshape", HD, N, 0, "reshape")
+    head0 = r
+    for op, c, d, g, k in mac(N, N, HD):
+        r = emit(ws, r, "QKt (1 head)", op, c, d, g, k)
+    r = emit(ws, r, "scale 1/sqrt(d)", "multiply", N, N, 0, "ew")
+    sm = "exp2" if variant == "base2_softmax" else "exp2"   # softmax uses exp2 either way
+    for op in ["max", "subtract", sm, "sum", "multiply(1/Z)"]:
+        r = emit(ws, r, "softmax (1 head)", op, N, N, 0, "ew")
+    for op, c, d, g, k in mac(N, HD, N):
+        r = emit(ws, r, "attn @ V (1 head)", op, c, d, g, k)
+    head_end = r - 1
+    bracket(ws, head0, head_end, "4X (heads)", AATAG)
+    rcc = r; r = emit(ws, r, "concat heads", "reshape", D, N, 0, "reshape")
+    total(ws, rcc, "total 4 heads [us]", f"=4*(SUM(T{head0}:T{head_end}))")
+    for op, c, d, g, k in mac(D, N, D):
+        r = emit(ws, r, "out proj D->D", op, c, d, g, k)
+    r = emit(ws, r, "Residual x+=msg", "add", D, N, 0, "ew")
+    for op, c, d, g, k in mac(2 * D, N, 2 * D):
+        r = emit(ws, r, "merge MLP 2D->2D", op, c, d, g, k)
+    r = emit(ws, r, "merge MLP relu", "relu", 2 * D, N, 0, "ew")
+    for op, c, d, g, k in mac(D, N, 2 * D):
+        r = emit(ws, r, "merge MLP 2D->D", op, c, d, g, k)
+    r = emit(ws, r, "Residual x+=mlp", "add", D, N, 0, "ew")
     blk_end = r - 1
-    # GNN total: sum of block T's (with the 4-head total cell) x GNN_BLOCKS
-    ws.cell(blk0, 25, ws.cell(blk0, 25).value)
-    ws.cell(blk0, 26, f"={GNN_BLOCKS}*(SUM(T{blk0}:T{blk_end})+Z{r_qkv+1}-T{r_qkt}-T{r_sc}-T{r_sm}-T{r_qkv})")
-    ws.cell(blk0 + 1, 25, "GNN total [us] ->")
-    ws.cell(blk0 + 1, 26, f"={GNN_BLOCKS}*(SUM(T{blk0}:T{blk_end})+Z{r_qkv+1}-T{r_qkt}-T{r_sc}-T{r_sm}-T{r_qkv})")
+    bracket(ws, blk0, blk_end, f"Attentional GNN block (x{GNN_BLOCKS}=18 layers x2 img)", YTAG)
+    gnn_z = f"={GNN_BLOCKS}*(SUM(T{blk0}:T{blk_end})+3*(SUM(T{head0}:T{head_end})))"
+    total(ws, blk_end, "GNN total [us] ->", gnn_z)
+    z_gnn = blk_end
 
-    # ---- Matching: final proj, score, Sinkhorn, readout ----
-    r_final = r
-    r = emit(ws, r, "Projection", "final proj (D->D)", D, N, 0, D, D, D, 0, 0, 0, D, N, 0, "linear",
-             ynote="Matching (x2 final proj)")
-    r_score = r
-    r = emit(ws, r, "Mat mul", "score = A^T B /sqrt d", D, N, 0, D, N, 0, 0, 0, 0, N, N, 0, "mm2")
-    r = emit(ws, r, "Reshape", "dustbin augment", NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, "reshape")
+    # ---- Matching ----
+    mat0 = r
+    rf = r
+    for op, c, d, g, k in mac(D, N, D):
+        r = emit(ws, r, "final proj D->D", op, c, d, g, k)
+    rfe = r - 1
+    rsc = r
+    for op, c, d, g, k in mac(N, N, D):
+        r = emit(ws, r, "score = A^T B", op, c, d, g, k)
+    rsce = r - 1
+    r = emit(ws, r, "scale 1/sqrt(d)", "multiply", N, N, 0, "ew")
+    rsc_mul = r - 1
+    r = emit(ws, r, "dustbin augment", "reshape", NP1, NP1, 0, "reshape")
 
-    # Sinkhorn iteration (row norm, col transpose, col norm) x T
-    norm_kind = "norm2" if variant == "max_sinkhorn" else "norm5"
+    # Sinkhorn iteration -> x T
     rsk = r
-    r = emit(ws, r, "Sinkhorn", "row normalize", NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, norm_kind,
-             ynote=f"Sinkhorn x{T} iters")
-    if variant == "transpose_free":
-        r = emit(ws, r, "Sinkhorn", "col transpose (eliminated)", NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, "reshape")
+    if variant == "max_sinkhorn":
+        row_ops = ["sum", "multiply(1/r)"]; col_ops = ["sum", "multiply(1/c)"]
     else:
-        r = emit(ws, r, "Sinkhorn", "col transpose", NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, "transp")
-    r = emit(ws, r, "Sinkhorn", "col normalize", NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, norm_kind)
+        row_ops = ["max", "exp2", "sum", "log", "subtract"]
+        col_ops = ["max", "exp2", "sum", "log", "subtract"]
+    for op in row_ops:
+        r = emit(ws, r, "Sinkhorn row norm", op, NP1, NP1, 0, "ew")
+    if variant != "transpose_free":
+        r = emit(ws, r, "Sinkhorn col transpose", "move", NP1, NP1, 0, "ew")
+    for op in col_ops:
+        r = emit(ws, r, "Sinkhorn col norm", op, NP1, NP1, 0, "ew")
     sk_end = r - 1
-    ws.cell(rsk, 26, f"={T}*(SUM(T{rsk}:T{sk_end}))")
-    ws.cell(rsk + 1, 25, f"Sinkhorn total (x{T}) [us] ->")
-    ws.cell(rsk + 1, 26, f"={T}*(SUM(T{rsk}:T{sk_end}))")
+    bracket(ws, rsk, sk_end, f"Sinkhorn (x{T} iters)", AATAG)
+    total(ws, sk_end, f"Sinkhorn total (x{T}) [us] ->", f"={T}*(SUM(T{rsk}:T{sk_end}))")
+    z_sink = sk_end
 
-    read_kind = "pass1" if variant == "fixed_thresh" else "softmax"
-    read_lbl = "argmax + fixed threshold" if variant == "fixed_thresh" else "dual-softmax readout"
-    r = emit(ws, r, "Matching", read_lbl, NP1, NP1, 0, 0, 0, 0, 0, 0, 0, NP1, NP1, 0, read_kind,
-             ynote="Match readout")
+    rd = r
+    if variant == "fixed_thresh":
+        for op in ["max(argmax)", "compare(threshold)"]:
+            r = emit(ws, r, "match readout", op, NP1, NP1, 0, "ew")
+    else:
+        for op in ["max", "exp2", "sum", "subtract", "multiply"]:
+            r = emit(ws, r, "match readout (dual-softmax)", op, NP1, NP1, 0, "ew")
+    rde = r - 1
+    bracket(ws, mat0, rde, "Matching", YTAG)
+    read_z = f"=SUM(T{rd}:T{rde})"
 
-    # ---- Grand total ----
-    r_read = r - 1
-    r += 1
-    ws.cell(r, 1, "GRAND TOTAL [us]")
-    ws.cell(r, 25, "variant: " + variant)
-    ws.cell(r, 26, f"=Z{enc_total-4}+Z{blk0+1}+2*T{r_final}+T{r_score}+Z{rsk+1}+T{r_read}")
+    # ---- Grand total + FPS ----
+    gt = r + 1
+    cstyle(ws.cell(gt, 1, "GRAND TOTAL [us]"), mob.cell(5, 1))
+    grand = (f"=Z{z_enc}+Z{z_gnn}+2*(SUM(T{rf}:T{rfe}))+SUM(T{rsc}:T{rsce})"
+             f"+T{rsc_mul}+Z{z_sink}+{read_z[1:]}")
+    total(ws, gt, "variant: " + variant, grand)
+    fr = gt + 1
+    cstyle(ws.cell(fr, 1, "FPS (image pair)"), mob.cell(5, 1))
+    total(ws, fr, "frames / sec ->", f"=1000000/Z{gt}")
     return ws
 
 
@@ -166,5 +195,4 @@ for v, nm in [("original", "SuperGlue (original)"),
     build(make_sheet(nm), v)
 
 wb.save(OUT)
-print("wrote", OUT)
-print("sheets:", wb.sheetnames)
+print("wrote", OUT, "\nsheets:", wb.sheetnames)
