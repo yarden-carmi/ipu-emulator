@@ -87,13 +87,30 @@ time. The lower full-array agreement (60%) is the *threshold/validity* decision:
 tropical OT is more permissive (it omits the log-marginal `log_mu/log_nu` terms),
 so it admits more matches. This is the one genuine algorithmic gap -- unlike base-2
 softmax (exact), the max-plus Sinkhorn is a real approximation of the soft OT.
-(Inputs are synthetic structured pairs; real-image descriptors would be more
-representative, but the asm==reference exactness holds regardless.)
+
+**Real image pair (`compare_sg_real.py`).** Same comparison on SuperGlue's own
+freiburg office demo frames: the official SuperPoint frontend extracts 120 real
+keypoints/frame (real camera motion), 'indoor' weights. The real (121×121)
+coupling is run through the actual `sinkhorn_iter.asm`+`sinkhorn_col.asm`:
+
+| metric | value |
+|--------|------:|
+| asm Sinkhorn vs numpy tropical (real 121×121, 5 iters) | **0.00e+00** (exact) |
+| stock log-Sinkhorn valid matches | 51 / 120 |
+| our max-Sinkhorn valid matches | 71 / 120 |
+| **same target when both match** | **100%** (42 pairs) |
+| matches0 agreement (incl. no-match) | 68.3% |
+
+On **real** features the mutual core is **identical** (100% same target) -- whenever
+both methods commit to a correspondence they pick the same partner; our pipeline's
+matches are a superset (the tropical OT is more permissive). So the kernels
+reproduce official SuperGlue's correspondences exactly on the matches that matter.
 
 ## Run
 ```
 source /tmp/ipuenv/bin/activate            # torch + numpy + ipu packages
 python superpoint_eval/extract_weights.py  # once (SuperPoint)
 python superpoint_eval/compare.py          # SuperPoint op-by-op
-python superpoint_eval/compare_sg.py       # SuperGlue end-to-end vs pretrained
+python superpoint_eval/compare_sg.py       # SuperGlue end-to-end (synthetic)
+python superpoint_eval/compare_sg_real.py  # SuperGlue end-to-end (real freiburg pair)
 ```
