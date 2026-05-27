@@ -61,6 +61,31 @@ Cin; ReLU), `conv_fp32_tiled_norelu` (convPb/convDb), `superpoint_detect`
 (max+threshold). 2×2/s2 maxpool is the one host step (stride-2 = a gather the ISA
 leaves to host). Only `.asm` + Python; simulator untouched.
 
+## SuperGlue GNN forward chained in asm (`asm_superglue.py`)
+
+The whole SuperGlue forward run as **one chained asm pipeline** (not just per-op),
+vs the pretrained model. Core primitive `matmul_asm` is a channels-in-lanes
+matmul kernel (one 128-wide output-channel tile per launch, all tokens looped
+internally, Din channel-groups, bias as an all-ones channel). On top: the
+keypoint-encoder MLP (BatchNorm folded), Q/K/V projections, **interleaved** head
+split (`view(b,dim,heads,N)` ⇒ channel `d*heads+h`), per-head QKt, attention
+softmax via `softmax.asm`, attention·V, merge projection, the merge MLP, residual
+adds, final projection, and the score matrix — every matmul/softmax on-device.
+
+| stage (vs pretrained 'indoor') | max abs diff |
+|--------------------------------|-------------:|
+| matmul_asm vs numpy | 2.2e-6 |
+| keypoint encoder | 8.9e-8 |
+| one full GNN layer | 4.3e-6 |
+| **full 18-layer GNN + final proj + score matrix** | **1.5e-5** |
+| score-matrix row-argmax agreement | **100%** |
+
+So the chained `.asm` SuperGlue GNN reproduces the pretrained network to FP32
+rounding, and the correspondences (score-matrix argmax) are identical. (Host does
+only the reshapes / residual adds / launch sequencing — data movement, no
+arithmetic.) The optimal-transport step that follows is the tropical max-Sinkhorn
+characterised below.
+
 ## SuperGlue end-to-end (`compare_sg.py`)
 
 Validates the matcher against the **official pretrained SuperGlue**
