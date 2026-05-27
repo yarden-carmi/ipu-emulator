@@ -33,7 +33,7 @@ def f32(vals):
     return struct.pack("<128f", *b)
 def relu(x): return x if x > 0 else 0.0
 
-CONV = _asm("conv_fp32.asm")
+CONV = _asm("old/conv_fp32.asm")
 DETECT = _asm("superpoint_detect.asm")
 print(f"conv_fp32 = {len(CONV)} words, superpoint_detect = {len(DETECT)} words (<=128: {len(CONV)<=128 and len(DETECT)<=128})")
 
