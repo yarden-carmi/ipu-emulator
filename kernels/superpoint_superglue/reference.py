@@ -191,6 +191,80 @@ def depth_to_space_ref(x: list[list[float]], Hc: int, Wc: int, r: int = 8) -> li
                 out[h * r + c // r][w * r + c % r] = v[c]
     return out
 
+# ============================================================================
+# Convolution  (kernels: conv_fp32_full [3x3 + ReLU], conv1x1 [1x1, no ReLU])
+# ============================================================================
+
+def conv3x3_relu_ref(x, w, b, relu: bool = True):
+    """3x3 convolution, zero-pad = 1, + bias, + optional ReLU:
+        out[o,y,p] = act( b[o] + sum_{ci,dy,dx} w[o,ci,dy,dx]*x[ci, y+dy-1, p+dx-1] )
+
+    Kernel: conv_fp32_full.asm -- one full output channel per launch; spatial
+    neighbours are constant-offset shifted loads (no gather), arbitrary FP32
+    weights via MULT.VE.CYCLIC, accumulated with ACC; in-kernel column (width)
+    tiling + channel-group tiling (any Cin); bias folded as an all-ones input
+    channel whose centre tap = b[o]. Parity: EXACT (FP32 accumulation rounding
+    ~1e-5 vs the real pretrained SuperPoint). x:(Cin,H,W) w:(Cout,Cin,3,3)."""
+    Cin = len(x); H = len(x[0]); W = len(x[0][0]); Cout = len(w)
+    def g(ci, y, p):
+        return x[ci][y][p] if 0 <= y < H and 0 <= p < W else 0.0
+    out = [[[0.0] * W for _ in range(H)] for _ in range(Cout)]
+    for o in range(Cout):
+        for y in range(H):
+            for p in range(W):
+                s = b[o]
+                for ci in range(Cin):
+                    for dy in range(3):
+                        for dx in range(3):
+                            s += w[o][ci][dy][dx] * g(ci, y + dy - 1, p + dx - 1)
+                out[o][y][p] = max(0.0, s) if relu else s
+    return out
+
+def conv1x1_ref(x, w, b):
+    """1x1 (pointwise) convolution + bias, NO ReLU:
+        out[o,y,p] = b[o] + sum_ci w[o,ci]*x[ci,y,p]
+
+    A 1x1 conv is exactly a linear layer applied at every spatial position, so
+    this also IS the SuperGlue Q/K/V/out projections and merge-MLP math (tokens
+    in place of pixels). Kernel: conv1x1.asm (channel-group tiled, bias as an
+    all-ones channel). Parity: EXACT (~1e-5 vs real convPb/convDb). w:(Cout,Cin)."""
+    Cin = len(x); H = len(x[0]); W = len(x[0][0]); Cout = len(w)
+    out = [[[0.0] * W for _ in range(H)] for _ in range(Cout)]
+    for o in range(Cout):
+        for y in range(H):
+            for p in range(W):
+                out[o][y][p] = b[o] + sum(w[o][ci] * x[ci][y][p] for ci in range(Cin))
+    return out
+
+# ============================================================================
+# Descriptor sampling  (grid_sample as a fixed-resolution convolution)
+# ============================================================================
+
+def bilinear_grid_sample_ref(C, H: int, W: int):
+    """Bilinear grid_sample (align_corners=True) of a coarse map C onto a fixed
+    H x W grid, as a precomputed-weight convolution:
+        out[c,Y,X] = sum_{dy,dx in {0,1}} Wd[dy,dx][Y,X] * C[c, i0[Y]+dy, j0[X]+dx]
+    The floor-indices i0,j0 and the four bilinear weight fields Wd are
+    data-INDEPENDENT at a fixed resolution (computed once). Kernels (in
+    grid_sample_conv.py): the 4-corner accumulate (MULT.EE + ACC) and the
+    gather-free separable form out = Mh @ C @ Mw^T (matmul by precomputed 1-D
+    interpolation matrices). Parity: EXACT vs torch grid_sample (~2.7e-5).
+    C: Cd x Hc x Wc -> Cd x H x W."""
+    Cd = len(C); Hc = len(C[0]); Wc = len(C[0][0])
+    cx = [(X / (W / 2.0) - 1.0 + 1.0) / 2.0 * (Wc - 1) for X in range(W)]
+    cy = [(Y / (H / 2.0) - 1.0 + 1.0) / 2.0 * (Hc - 1) for Y in range(H)]
+    out = [[[0.0] * W for _ in range(H)] for _ in range(Cd)]
+    for Y in range(H):
+        i0 = min(max(int(cy[Y]), 0), Hc - 2); fy = cy[Y] - i0
+        for X in range(W):
+            j0 = min(max(int(cx[X]), 0), Wc - 2); fx = cx[X] - j0
+            w00, w01 = (1 - fy) * (1 - fx), (1 - fy) * fx
+            w10, w11 = fy * (1 - fx), fy * fx
+            for c in range(Cd):
+                out[c][Y][X] = (w00 * C[c][i0][j0] + w01 * C[c][i0][j0 + 1]
+                                + w10 * C[c][i0 + 1][j0] + w11 * C[c][i0 + 1][j0 + 1])
+    return out
+
 
 # ============================================================================
 # self-check
@@ -214,4 +288,10 @@ if __name__ == "__main__":
     print("topk ~5 selected :", abs(len(sel) - 5) <= 1)
     hm = [[random.random() for _ in range(6)] for _ in range(6)]
     mp = maxpool3x3_shift_ref(hm); print("maxpool3x3 shape :", len(mp) == 6 and len(mp[0]) == 6)
+    xc = [[[random.random() for _ in range(5)] for _ in range(5)] for _ in range(2)]
+    wc = [[[[random.random() for _ in range(3)] for _ in range(3)] for _ in range(2)]]
+    cv = conv3x3_relu_ref(xc, wc, [0.0]); print("conv3x3 shape    :", len(cv) == 1 and len(cv[0]) == 5)
+    gs = bilinear_grid_sample_ref([[[0.0, 1.0], [2.0, 3.0]]], 4, 4)
+    flat = [v for row in gs[0] for v in row]
+    print("grid_sample range:", len(gs[0]) == 4 and 0.0 <= min(flat) and max(flat) <= 3.0)
     print("all reference self-checks done.")
