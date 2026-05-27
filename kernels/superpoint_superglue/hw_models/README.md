@@ -20,11 +20,11 @@ weights are found via the local `weights/` dir or the in-repo submodule.)
 | operation | kernel | hardware form | vs stock |
 |-----------|--------|---------------|----------|
 | conv1a–4b, convPa/Da (3×3+ReLU) | `conv_fp32_full` | shifted-load MAC + ReLU | identical |
-| 2×2/s2 maxpool | shifted max + stride-2 gather | — | identical |
+| 2×2/s2 maxpool | `maxpool_shift.asm` | **running max over 4 shifted taps** + stride-2 | identical (0) |
 | convPb, convDb (1×1) | `conv1x1` | pointwise MAC | identical |
 | detector softmax(65) | `softmax.asm` | **`2^(log2e·x)`** | 7e-8 |
 | depth-to-space | `pixel_shuffle.asm` | plane relocation | identical |
-| simple_nms | `maxpool_shift.asm` | local-max via shifted loads | identical |
+| simple_nms | `maxpool_shift.asm` | local-max via shifted loads (Rx window) | identical (0) |
 | score threshold | `topk.asm` | `relu(s−τ)` | identical |
 | top-k cap | `topk_mt.asm` | **calibrated τ (soft count + host bisect), no sort** | **set ≈, count ±few** |
 | descriptor L2 | `l2_normalize.asm` | **`x·rsqrt(Σx²)`** (inv_sqrt) | 6e-8 |
@@ -43,6 +43,7 @@ weights are found via the local `weights/` dir or the in-repo submodule.)
 
 ## Verification (`check_hw_models.py`, freiburg pair)
 ```
+maxpool_shift vs F.max_pool2d    0.00e+00  (2x2/s2, 9x9 NMS, 3x3)
 exp2 softmax vs F.softmax        7.45e-08
 rsqrt L2norm vs F.normalize      5.96e-08
 4-corner bilinear vs grid_sample 5.96e-08

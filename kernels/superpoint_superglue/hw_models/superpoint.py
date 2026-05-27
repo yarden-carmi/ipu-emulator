@@ -28,6 +28,28 @@ from torch import nn
 LOG2E = 1.4426950408889634
 
 
+def maxpool_shift(x, kernel: int, stride: int, pad: int):
+    """Window max as the hardware computes it (maxpool_shift.asm): a running
+    element-wise max over the kernel*kernel shifted taps (each a constant-offset
+    contiguous load), with a -3.4e38 border seed. Bit-identical to
+    F.max_pool2d(kernel, stride, pad)."""
+    nd = x.dim()
+    if nd == 3:
+        x = x[:, None]                                        # (b,H,W) -> (b,1,H,W)
+    NEG = -3.4e38
+    H, W = x.shape[-2:]
+    xp = torch.nn.functional.pad(x, (pad, pad, pad, pad), value=NEG)
+    Ho = (H + 2 * pad - kernel) // stride + 1
+    Wo = (W + 2 * pad - kernel) // stride + 1
+    out = x.new_full((*x.shape[:2], Ho, Wo), NEG)
+    for dy in range(kernel):
+        for dx in range(kernel):                              # tap (dy,dx) = shifted load
+            tap = xp[:, :, dy:dy + stride * (Ho - 1) + 1:stride,
+                          dx:dx + stride * (Wo - 1) + 1:stride]
+            out = torch.maximum(out, tap)                     # ACC.MAX
+    return out[:, 0] if nd == 3 else out
+
+
 def exp2_softmax(x, dim):
     """softmax via 2^x (softmax.asm): 2^(log2e*(x-m)) / sum.  == F.softmax."""
     s = (x - x.max(dim=dim, keepdim=True).values) * LOG2E
@@ -42,11 +64,10 @@ def l2_normalize(x, dim):
 
 
 def simple_nms(scores, nms_radius: int):
-    """Maxpool-based NMS (maxpool_shift.asm: local max via shifted loads)."""
+    """Maxpool-based NMS (maxpool_shift.asm local max via shifted loads)."""
     assert nms_radius >= 0
     def max_pool(x):
-        return torch.nn.functional.max_pool2d(
-            x, kernel_size=nms_radius * 2 + 1, stride=1, padding=nms_radius)
+        return maxpool_shift(x, kernel=nms_radius * 2 + 1, stride=1, pad=nms_radius)
     zeros = torch.zeros_like(scores)
     max_mask = scores == max_pool(scores)
     for _ in range(2):
@@ -138,9 +159,10 @@ class SuperPoint(nn.Module):
         print('Loaded SuperPoint model [hardware-faithful]')
 
     def forward(self, data):
-        x = self.relu(self.conv1a(data['image'])); x = self.relu(self.conv1b(x)); x = self.pool(x)
-        x = self.relu(self.conv2a(x)); x = self.relu(self.conv2b(x)); x = self.pool(x)
-        x = self.relu(self.conv3a(x)); x = self.relu(self.conv3b(x)); x = self.pool(x)
+        mp = lambda t: maxpool_shift(t, kernel=2, stride=2, pad=0)   # 2x2/s2 = max of 4 taps
+        x = self.relu(self.conv1a(data['image'])); x = self.relu(self.conv1b(x)); x = mp(x)
+        x = self.relu(self.conv2a(x)); x = self.relu(self.conv2b(x)); x = mp(x)
+        x = self.relu(self.conv3a(x)); x = self.relu(self.conv3b(x)); x = mp(x)
         x = self.relu(self.conv4a(x)); x = self.relu(self.conv4b(x))
 
         cPa = self.relu(self.convPa(x))
