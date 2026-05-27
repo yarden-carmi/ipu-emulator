@@ -32,6 +32,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SGDIR = os.path.join(ROOT, "third_party", "superglue")
 sys.path.insert(0, SGDIR)
 import models.superglue as sgmod
+import models.superpoint as spmod
 from models.matching import Matching
 
 LOG2E = 1.4426950408889634
@@ -66,14 +67,36 @@ def hw_log_optimal_transport(scores, alpha, iters):
     return Z
 
 
-def apply_hw_math(exp2_softmax=True, tropical_ot=True):
-    """Switch the SuperGlue module to the hardware kernels' math (in place)."""
+def hw_top_k_keypoints(keypoints, scores, k):
+    """SuperPoint top-k keypoint cap as the hardware does it: no sort (the ISA
+    has none) -- topk_mt.asm emits the soft survivor count Sum sigmoid(T(s-tau))
+    and the HOST binary-searches tau so the count ~ k, then keeps {s > tau}
+    (topk.asm: relu(s-tau)). The selected set equals torch.topk's set up to the
+    calibration precision + ties (tau converges to the k-th largest score)."""
+    if k >= len(keypoints):
+        return keypoints, scores
+    T = 64.0
+    lo, hi = float(scores.min()), float(scores.max())
+    for _ in range(24):                                   # host bisection on tau
+        mid = 0.5 * (lo + hi)
+        cnt = torch.sigmoid(T * (scores - mid)).sum().item()   # device soft count
+        lo, hi = (mid, hi) if cnt > k else (lo, mid)
+    tau = 0.5 * (lo + hi)
+    mask = scores > tau                                   # topk.asm threshold gate
+    return keypoints[mask], scores[mask]
+
+
+def apply_hw_math(exp2_softmax=True, tropical_ot=True, hw_topk=True):
+    """Switch SuperPoint+SuperGlue to the hardware kernels' math (in place)."""
     if tropical_ot:
         _ORIG.setdefault("ot", sgmod.log_optimal_transport)
         sgmod.log_optimal_transport = hw_log_optimal_transport
     if exp2_softmax:
         _ORIG.setdefault("attn", sgmod.attention)
         sgmod.attention = hw_attention
+    if hw_topk:
+        _ORIG.setdefault("topk", spmod.top_k_keypoints)
+        spmod.top_k_keypoints = hw_top_k_keypoints
 
 
 def restore_stock_math():
@@ -81,6 +104,8 @@ def restore_stock_math():
         sgmod.log_optimal_transport = _ORIG.pop("ot")
     if "attn" in _ORIG:
         sgmod.attention = _ORIG.pop("attn")
+    if "topk" in _ORIG:
+        spmod.top_k_keypoints = _ORIG.pop("topk")
 
 
 def build_matching(config):
@@ -129,27 +154,35 @@ if __name__ == "__main__":
     cfg = {"superpoint": {"max_keypoints": 256, "keypoint_threshold": 0.005, "nms_radius": 4},
            "superglue": {"weights": "indoor"}}
 
-    def run():
-        m = build_matching(cfg)
+    m = build_matching(cfg)
+    m = build_matching(cfg)
+    def run(data):
         with torch.no_grad():
-            pred = m({"image0": im0, "image1": im1})
-        return {k: (v[0].cpu().numpy() if torch.is_tensor(v) else v[0]) for k, v in pred.items()}
+            return m(data)                                   # raw pred (tensors/lists)
+    def npy(pred):
+        return {k: pred[k][0].detach().cpu().numpy() for k in pred}   # [0] = drop batch / list
 
-    restore_stock_math()
-    stock = run()
-    apply_hw_math()
-    hw = run()
-    restore_stock_math()
+    # full pipelines (hardware top-k changes the keypoint COUNT, so draw each on
+    # its own keypoints; counts reported separately)
+    restore_stock_math(); raw_s = run({"image0": im0, "image1": im1}); stock = npy(raw_s)
+    apply_hw_math();       hw = npy(run({"image0": im0, "image1": im1})); restore_stock_math()
+    print("FULL pipeline (SuperPoint topk + SuperGlue OT):")
+    print(f"  keypoints  stock {len(stock['keypoints0'])}/{len(stock['keypoints1'])}"
+          f"   hardware {len(hw['keypoints0'])}/{len(hw['keypoints1'])}   (hw topk = calibrated threshold)")
+    print(f"  matches    stock {(stock['matches0']>=0).sum()}   hardware {(hw['matches0']>=0).sum()}")
+    ns = _draw_matches(None, p0, p1, stock["keypoints0"], stock["keypoints1"], stock["matches0"], "/tmp/matches_stock.png")
+    nh = _draw_matches(None, p0, p1, hw["keypoints0"], hw["keypoints1"], hw["matches0"], "/tmp/matches_hw.png")
+    print(f"  wrote /tmp/matches_stock.png ({ns}), /tmp/matches_hw.png ({nh})")
 
-    kp0, kp1 = stock["keypoints0"], stock["keypoints1"]
-    m_s, m_h = stock["matches0"], hw["matches0"]
-    both = (m_s >= 0) & (m_h >= 0)
-    print(f"keypoints: {len(kp0)} / {len(kp1)}")
-    print(f"  stock (log-Sinkhorn) matches:   {(m_s>=0).sum()}")
-    print(f"  hardware (max-Sinkhorn) matches:{(m_h>=0).sum()}")
-    print(f"  matches0 agreement (incl -1):    {(m_s==m_h).mean()*100:.1f}%")
-    print(f"  same target when both match:     "
-          f"{(m_s[both]==m_h[both]).mean()*100:.1f}%  ({both.sum()} pairs)")
-    ns = _draw_matches(None, p0, p1, kp0, kp1, m_s, "/tmp/matches_stock.png")
-    nh = _draw_matches(None, p0, p1, kp0, kp1, m_h, "/tmp/matches_hw.png")
-    print(f"wrote /tmp/matches_stock.png ({ns} lines), /tmp/matches_hw.png ({nh} lines)")
+    # isolated OT comparison on IDENTICAL keypoints (feed stock features to both)
+    fixed = {"image0": im0, "image1": im1}
+    for i in "01":
+        for a in ("keypoints", "scores", "descriptors"):
+            v = raw_s[a + i]
+            fixed[a + i] = (v[0] if isinstance(v, (list, tuple)) else v[0])[None]
+    restore_stock_math(); s = npy(run(fixed))
+    apply_hw_math();       h = npy(run(fixed)); restore_stock_math()
+    ms, mh = s["matches0"], h["matches0"]; both = (ms >= 0) & (mh >= 0)
+    print("Isolated OT (same keypoints fed to both):")
+    print(f"  matches    stock {(ms>=0).sum()}   hardware {(mh>=0).sum()}")
+    print(f"  same target when both match: {(ms[both]==mh[both]).mean()*100:.1f}%  ({both.sum()} pairs)")
