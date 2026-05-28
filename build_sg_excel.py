@@ -172,7 +172,7 @@ def write_total(ws, r, label, zformula):
 
 
 def build_sp_sheet():
-    ws = make_sheet("SuperPoint")
+    ws = make_sheet("SuperPoint (original)")
     rows = rows_for_superpoint(K_kpts=N)
     for i, row in enumerate(rows):
         emit_row(ws, 2 + i, *row)
@@ -233,6 +233,76 @@ def build_sg_sheet(variant, name):
     cstyle(ws.cell(fr, 1, "FPS (SG alone)"), mob.cell(5, 1))
     write_total(ws, fr, "frames / sec ->", f"=1000000/Z{gt}")
     return ws, gt
+
+
+def build_measured_sp_sheet():
+    """SuperPoint per image, with cycles MEASURED via the emulator rates."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__),
+                                    "kernels/superpoint_superglue/superpoint_eval"))
+    from measure_kernels import rates
+    R = rates()
+    def tiles(e): return math.ceil(e / 128)
+    def opcyc(kind, c, d, K):
+        if kind == "mac":  return tiles(c * d) * (R["mac_step"] * K + R["tile_ovh"])
+        if kind == "ew":   return tiles(c * d) * R["ew_tile"]
+        if kind == "taps": return tiles(c * d) * K * R["ew_tile"]
+        if kind == "sm":   return d * tiles(c) * R["softmax128"]
+        return 0.0
+    ROWS = [("Input image load", "load", IMG_H, IMG_W, 0, "rsh", "M", 1)]
+    enc = [(IMG_H, IMG_W, [(1, 64, 'conv1a'), (64, 64, 'conv1b')]),
+           (IMG_H // 2, IMG_W // 2, [(64, 64, 'conv2a'), (64, 64, 'conv2b')]),
+           (IMG_H // 4, IMG_W // 4, [(64, 128, 'conv3a'), (128, 128, 'conv3b')]),
+           (IMG_H // 8, IMG_W // 8, [(128, 128, 'conv4a'), (128, 128, 'conv4b')])]
+    for i, (H, W, convs) in enumerate(enc):
+        for cin, cout, name in convs:
+            ROWS.append((f'{name} 3x3+ReLU', 'MAC', cout, H * W, cin * 9, 'mac', 'D', 1))
+        if i < len(enc) - 1:
+            outH, outW = H // 2, W // 2
+            ROWS.append((f'maxpool 2x2/s2 -> {outH}x{outW}', 'max(4 taps)',
+                         convs[-1][1], outH * outW, 4, 'taps', 'D', 1))
+    Hd, Wd = IMG_H // 8, IMG_W // 8
+    ROWS += [
+        ('convPa 3x3+ReLU', 'MAC', 256, Hd * Wd, 128 * 9, 'mac', 'D', 1),
+        ('convPb 1x1 (->65)', 'MAC', 65, Hd * Wd, 256, 'mac', 'D', 1),
+        ('detector softmax(65)', 'softmax', 65, Hd * Wd, 0, 'sm', 'D', 1),
+        ('depth-to-space', 'reshape', 64, Hd * Wd, 0, 'rsh', 'M', 1),
+        ('simple_nms 9x9 iter 3', 'maxpool', IMG_H, IMG_W, 243, 'taps', 'D', 1),
+        ('score threshold', 'relu(s-tau)', IMG_H, IMG_W, 0, 'ew', 'D', 1),
+        ('topk cap (calibrated)', 'soft count + bisect', IMG_H, IMG_W, 30, 'taps', 'H', 1),
+        ('convDa 3x3+ReLU', 'MAC', 256, Hd * Wd, 128 * 9, 'mac', 'D', 1),
+        ('convDb 1x1 (->256)', 'MAC', 256, Hd * Wd, 256, 'mac', 'D', 1),
+        ('descriptor L2 (dense)', '3 passes', 256, Hd * Wd, 3, 'taps', 'D', 1),
+        ('grid_sample (4-corner)', 'MAC', 256, N, 4, 'mac', 'D', 1),
+        ('per-keypoint L2', '3 passes', 256, N, 3, 'taps', 'D', 1),
+    ]
+    ws = make_sheet("SuperPoint (measured)")
+    total = 0.0
+    for i, (gr, op, c, d, K, kind, host, mult) in enumerate(ROWS):
+        r = 2 + i
+        cyc = round(opcyc(kind, c, d, K) * mult)
+        total += cyc
+        vals = {"A": gr, "B": op, "C": c, "D": d, "E": K, "F": 0, "G": K, "H": mult,
+                "I": 0, "J": 0, "K": 0, "L": c, "M": d, "N": 0,
+                "O": f"=C{r}*D{r}/1024", "P": 0, "Q": 0, "R": f"=L{r}*M{r}/1024",
+                "S": cyc, "T": f"=(S{r}/$Y$2)/1000"}
+        if kind == "rsh" or cyc == 0:
+            vals["S"] = 0; vals["T"] = 0
+            for cc in "UVWX": vals[cc] = 0
+        else:
+            for cc, src in [("U", "O"), ("V", "P"), ("W", "Q"), ("X", "R")]:
+                vals[cc] = f"=(({src}{r}*8*1024)/$T{r})/1000"
+        for col, v in vals.items():
+            cstyle(ws.cell(r, COLS.index(col) + 1, v), mob.cell(5, COLS.index(col) + 1))
+        cstyle(ws.cell(r, HOST_COL, host), mob.cell(5, 1))
+    last = 1 + len(ROWS)
+    write_total(ws, last, "SuperPoint per image [us] ->", f"=SUM(T2:T{last})")
+    gt = last + 2
+    cstyle(ws.cell(gt, 1, "GRAND TOTAL [us] (x2 images)"), mob.cell(5, 1))
+    write_total(ws, gt, "2 images ->", f"=2*Z{last}")
+    fr = gt + 1
+    cstyle(ws.cell(fr, 1, "FPS (SP measured alone)"), mob.cell(5, 1))
+    write_total(ws, fr, "frames / sec ->", f"=1000000/Z{gt}")
+    return ws, gt, total, R
 
 
 def build_measured_sg_sheet():
@@ -394,7 +464,8 @@ def evaluate(ws, addr):
 
 
 # ---------------- build sheets -----------------------------------------------
-sp_ws, sp_gt = build_sp_sheet()
+sp_ws, sp_gt = build_sp_sheet()                                # SuperPoint (original)
+sp_meas_ws, sp_meas_gt, sp_meas_total_cyc, _ = build_measured_sp_sheet()  # SuperPoint (measured)
 
 VARIANTS = [("original", "SuperGlue (original)"),
             ("max_sinkhorn", "SG max-Sinkhorn"),
@@ -411,23 +482,35 @@ meas_ws, meas_gt, meas_total_cyc, meas_rates = build_measured_sg_sheet()
 # ---- Pipeline Summary sheet -------------------------------------------------
 def build_summary():
     ws = make_sheet("Pipeline Summary")
-    ws.cell(1, 1, "variant"); ws.cell(1, 2, "SuperPoint x2 [us]")
+    ws.cell(1, 1, "row"); ws.cell(1, 2, "SuperPoint x2 [us]")
     ws.cell(1, 3, "SuperGlue [us]"); ws.cell(1, 4, "Total [us]"); ws.cell(1, 5, "FPS")
     for c in range(1, 6): cstyle(ws.cell(1, c), mob.cell(1, 1))
+    # Analytical block (SP original x2 + each SG variant)
     for r, (v, nm) in enumerate(VARIANTS, start=2):
         sg_gt = gt_by_sheet[nm][1]
-        ws.cell(r, 1, nm)
-        ws.cell(r, 2, f"='SuperPoint'!Z{sp_gt}")
+        ws.cell(r, 1, f"{nm}  (analytical)")
+        ws.cell(r, 2, f"='SuperPoint (original)'!Z{sp_gt}")
         ws.cell(r, 3, f"='{nm}'!Z{sg_gt}")
         ws.cell(r, 4, f"=B{r}+C{r}")
         ws.cell(r, 5, f"=1000000/D{r}")
         for c in range(1, 6): cstyle(ws.cell(r, c), mob.cell(5, 1))
+    # Measured block (SP measured x2 + SG measured)
     r = 2 + len(VARIANTS) + 1
-    ws.cell(r, 1, "SG max-Sinkhorn (measured)")
-    ws.cell(r, 2, f"='SuperPoint'!Z{sp_gt}")
+    ws.cell(r, 1, "SuperPoint x2 (measured)")
+    ws.cell(r, 2, f"='SuperPoint (measured)'!Z{sp_meas_gt}")
+    ws.cell(r, 3, 0); ws.cell(r, 4, f"=B{r}"); ws.cell(r, 5, f"=1000000/D{r}")
+    for c in range(1, 6): cstyle(ws.cell(r, c), mob.cell(5, 1))
+    r += 1
+    ws.cell(r, 1, "SuperGlue (measured)")
+    ws.cell(r, 2, 0)
     ws.cell(r, 3, f"='SuperGlue (measured)'!Z{meas_gt}")
-    ws.cell(r, 4, f"=B{r}+C{r}")
-    ws.cell(r, 5, f"=1000000/D{r}")
+    ws.cell(r, 4, f"=C{r}"); ws.cell(r, 5, f"=1000000/D{r}")
+    for c in range(1, 6): cstyle(ws.cell(r, c), mob.cell(5, 1))
+    r += 1
+    ws.cell(r, 1, "FULL PIPELINE (measured)")
+    ws.cell(r, 2, f"='SuperPoint (measured)'!Z{sp_meas_gt}")
+    ws.cell(r, 3, f"='SuperGlue (measured)'!Z{meas_gt}")
+    ws.cell(r, 4, f"=B{r}+C{r}"); ws.cell(r, 5, f"=1000000/D{r}")
     for c in range(1, 6): cstyle(ws.cell(r, c), mob.cell(5, 1))
     return ws
 
@@ -439,11 +522,17 @@ wb.save(OUT)
 print(f"\nwrote {OUT}\nsheets: {wb.sheetnames}\n")
 
 sp_py = 2 * py_sp_per_image()
-sp_xls = evaluate(wb["SuperPoint"], f"Z{sp_gt}")
+sp_xls = evaluate(wb["SuperPoint (original)"], f"Z{sp_gt}")
 sp_ok = abs(sp_py - sp_xls) / max(sp_py, 1) < 1e-9
-print(f"{'SuperPoint (x2 images)':30s}  PY {sp_py:11.1f}  XLS {sp_xls:11.1f}  "
-      f"FPS {evaluate(wb['SuperPoint'], f'Z{sp_gt+1}'):5.2f}  {'PASS' if sp_ok else 'FAIL'}")
-all_ok = sp_ok
+print(f"{'SuperPoint (original) x2':30s}  PY {sp_py:11.1f}  XLS {sp_xls:11.1f}  "
+      f"FPS {evaluate(wb['SuperPoint (original)'], f'Z{sp_gt+1}'):5.2f}  {'PASS' if sp_ok else 'FAIL'}")
+sp_meas_x2 = 2 * sp_meas_total_cyc / 1000
+sp_meas_xls = evaluate(wb["SuperPoint (measured)"], f"Z{sp_meas_gt}")
+sp_meas_ok = abs(sp_meas_x2 - sp_meas_xls) / max(sp_meas_x2, 1) < 1e-6
+print(f"{'SuperPoint (measured) x2':30s}  PY {sp_meas_x2:11.1f}  XLS {sp_meas_xls:11.1f}  "
+      f"FPS {evaluate(wb['SuperPoint (measured)'], f'Z{sp_meas_gt+1}'):5.2f}  "
+      f"{'PASS' if sp_meas_ok else 'FAIL'}")
+all_ok = sp_ok and sp_meas_ok
 for v, nm in VARIANTS:
     py = py_sg(v)
     ws = wb[nm]; gt = gt_by_sheet[nm][1]
@@ -458,10 +547,12 @@ fps_meas = evaluate(wb[nm], f"Z{meas_gt + 1}")
 print(f"{nm:30s}  PY {meas_total_cyc/1000:11.1f}  XLS {xls_meas:11.1f}  FPS {fps_meas:5.2f}  "
       f"{'PASS' if abs(meas_total_cyc/1000-xls_meas)/max(xls_meas,1)<1e-6 else 'FAIL'}")
 print(f"\nmeasured rates: {dict((k, round(v, 3)) for k, v in meas_rates.items())}")
-print(f"\nfull-pipeline totals (SP x2 + SG variant):")
+print(f"\nfull-pipeline totals:")
+print(f"  ----- analytical (SP original x2 + SG variant) -----")
 for v, nm in VARIANTS:
     py = py_sg(v); full = sp_py + py
     print(f"  {nm:30s}  total {full:11.1f} us  FPS {1e6/full:5.2f}")
-full_meas = sp_py + meas_total_cyc / 1000
-print(f"  {'SuperGlue (measured)':30s}  total {full_meas:11.1f} us  FPS {1e6/full_meas:5.2f}")
+full_meas = sp_meas_x2 + meas_total_cyc / 1000
+print(f"  ----- measured (SP measured x2 + SG measured) -----")
+print(f"  {'full pipeline (measured)':30s}  total {full_meas:11.1f} us  FPS {1e6/full_meas:5.2f}")
 print("\n", "ALL PASS" if all_ok else "SOME FAILED")
