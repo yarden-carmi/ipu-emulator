@@ -308,7 +308,7 @@ def build_measured_sheet():
         ("V proj D->D", "MAC", D, N, D, "mac", g),
         ("QKt", "MAC", N, N, HD, "mac", g * HEADS),
         ("scale", "multiply", N, N, 0, "ew", g * HEADS),
-        ("softmax (multi-tile)", "softmax_mt.asm", N, N, 0, "sm_mt", g * HEADS),
+        ("softmax", "max,exp2,sum,mul", N, N, 0, "sm", g * HEADS),
         ("attn @ V", "MAC", N, HD, N, "mac", g * HEADS),
         ("out proj", "MAC", D, N, D, "mac", g),
         ("Residual x+=msg", "add", D, N, 0, "ew", g),
