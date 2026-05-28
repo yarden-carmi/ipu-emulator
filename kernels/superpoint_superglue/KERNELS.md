@@ -39,6 +39,7 @@ POST_AAQ, `AGG` reduces R_ACC); reductions span ≤128 lanes, larger vectors loo
 | 1 | `conv_fp32_full` | 3×3 conv + bias + ReLU | `conv3x3_relu_ref` | EXACT | 1e-5 vs real SuperPoint |
 | 2 | `conv1x1` | 1×1 conv + bias | `conv1x1_ref` | EXACT | 1e-5 vs real convPb/convDb |
 | 3 | `softmax` | softmax over ≤128 | `softmax_ref` | FULL (base convention) | exact |
+| 3b | `softmax_mt` | softmax over N=ntiles·128 | `softmax_ref` | FULL | exact (≤1.5e-8) |
 | 4 | `l2_normalize` | x/‖x‖₂ | `l2_normalize_ref` | FULL | exact |
 | 5 | `layernorm` | (x−μ)/√σ²·γ+β | `layernorm_ref` | NEAR-FULL (ε) | exact (ε=0) |
 | 6 | `maxpool_shift` | 3×3 sliding max | `maxpool3x3_shift_ref` | FULL, host-free | exact |
