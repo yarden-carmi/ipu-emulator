@@ -72,6 +72,18 @@ def measure_softmax(N=128):
                writes=[(0x1000, [0.1 * i for i in range(N)]), (0x3000, [1.0] * 128)])
 
 
+SOFTMAX_MT = open(os.path.join(KDIR, "softmax_mt.asm")).read()
+def measure_softmax_mt(N=512):
+    ntiles = N // 128
+    return run(SOFTMAX_MT,
+               [(0, 0), (1, 1), (2, 0x1000), (3, 0x10000), (4, 0x20000),
+                (5, 0x30000), (6, ntiles), (7, 0xBF800000), (8, 512), (9, 128),
+                (10, 0x40000)],
+               writes=[(0x1000 + t * 512, [0.01 * (t * 128 + i) for i in range(128)])
+                       for t in range(ntiles)]
+                     + [(0x20000, [1.0] * 128), (0x40000, [-3.4e38] * 128)])
+
+
 SROW = open(os.path.join(KDIR, "sinkhorn_iter.asm")).read()
 SCOL = open(os.path.join(KDIR, "sinkhorn_col.asm")).read()
 def measure_sink_row(R, cols=128):
@@ -113,8 +125,9 @@ def rates():
     sm = measure_softmax(128)                               # cyc per 128-lane softmax row
     sr = measure_sink_row(64) / 64.0                        # cyc per row, row half-step (<=128 col)
     sc = measure_sink_col(64) / 64.0                        # cyc per row, col half-step (<=128 col)
+    smt = measure_softmax_mt(512)                           # cyc for one N=512 softmax_mt call
     return {"mac_step": a, "tile_ovh": b, "ew_tile": ew, "softmax128": sm,
-            "sink_row": sr, "sink_col": sc}
+            "softmax_mt_512": smt, "sink_row": sr, "sink_col": sc}
 
 
 if __name__ == "__main__":
