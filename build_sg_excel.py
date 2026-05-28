@@ -27,6 +27,7 @@ from openpyxl.utils import get_column_letter
 # ---------------- parameters -------------------------------------------------
 N, D, HEADS, HD, NP1, T = 512, 256, 4, 64, 513, 100
 GNN_BLOCKS = 18 * 2                                            # 18 self/cross x 2 images
+IMG_H, IMG_W = 480, 640                                        # SuperPoint input
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else \
     "/root/.claude/uploads/eecfeba7-80e7-4f8a-8032-ec4e983b04a4/cb06a587-IPU_2.xlsx"
@@ -39,6 +40,46 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/user/ipu-emulator/IPU_2_Super
 #   kind 'rsh'  -> S = 0           (reshape/view; T=0)
 def mac(group, c, d, K):
     return [(group, "multiply", c, d, K, "mac"), (group, "accumulate", c, d, K, "mac")]
+
+
+def rows_for_superpoint(K_kpts=N):
+    """Per-image SuperPoint rows (encoder + detector + descriptor). Multiplied by
+    2 in the grand total (one image per side of the pair)."""
+    rows = []
+    # ---- shared encoder: 4 stages of (conv,conv) + 2x2/s2 maxpool ----
+    enc = [(IMG_H, IMG_W, [(1, 64, 'conv1a'), (64, 64, 'conv1b')]),
+           (IMG_H // 2, IMG_W // 2, [(64, 64, 'conv2a'), (64, 64, 'conv2b')]),
+           (IMG_H // 4, IMG_W // 4, [(64, 128, 'conv3a'), (128, 128, 'conv3b')]),
+           (IMG_H // 8, IMG_W // 8, [(128, 128, 'conv4a'), (128, 128, 'conv4b')])]
+    cur_C = 0
+    for i, (H, W, convs) in enumerate(enc):
+        for cin, cout, name in convs:
+            rows += mac(f'{name} 3x3+ReLU', cout, H * W, cin * 9)
+            cur_C = cout
+        if i < len(enc) - 1:                                   # pool between stages (3 pools)
+            outH, outW = H // 2, W // 2
+            rows.append((f'maxpool 2x2/s2 -> {outH}x{outW}', 'max (4 taps)',
+                         cur_C, outH * outW, 4, 'mac'))         # 4 shifted-max taps
+    # ---- detector head (at 60x80) ----
+    H, W = IMG_H // 8, IMG_W // 8
+    rows += mac('convPa 3x3+ReLU', 256, H * W, 128 * 9)
+    rows += mac('convPb 1x1 (->65)', 65, H * W, 256)
+    for op in ['max', 'subtract', 'exp2', 'sum', 'multiply(1/Z)']:
+        rows.append(('detector softmax(65)', op, 65, H * W, 0, 'ew'))
+    rows.append(('depth-to-space', 'reshape', 64, H * W, 0, 'rsh'))
+    Hf, Wf = H * 8, W * 8                                       # 480 x 640 heatmap
+    rows.append(('simple_nms 9x9 iter 3', 'maxpool 243 taps', Hf, Wf, 243, 'mac'))
+    rows.append(('score threshold', 'relu(s-tau)', Hf, Wf, 0, 'ew'))
+    rows.append(('topk cap (calibrated)', 'soft count + bisect', Hf, Wf, 30, 'mac'))
+    # ---- descriptor head (at 60x80) ----
+    rows += mac('convDa 3x3+ReLU', 256, H * W, 128 * 9)
+    rows += mac('convDb 1x1 (->256)', 256, H * W, 256)
+    for op in ['mul (squares)', 'sum-reduce', 'multiply (scale by rsqrt)']:
+        rows.append(('descriptor L2 (dense)', op, 256, H * W, 0, 'ew'))
+    rows += mac('grid_sample (4-corner)', 256, K_kpts, 4)
+    for op in ['mul (squares)', 'sum-reduce', 'multiply (scale by rsqrt)']:
+        rows.append(('per-keypoint L2', op, 256, K_kpts, 0, 'ew'))
+    return rows
 
 
 def rows_for_variant(variant):
@@ -148,7 +189,10 @@ def write_total(ws, r, label, zformula):
 
 def build_sheet(variant, name):
     ws = make_sheet(name)
-    rows = rows_for_variant(variant)
+    sp_rows = rows_for_superpoint(K_kpts=N)
+    sg_rows = rows_for_variant(variant)
+    rows = sp_rows + sg_rows
+    sp_end = 1 + len(sp_rows)                                  # last SP row (1-indexed)
     # find indices for the per-image / per-head / per-block / x-T totals
     idx_groups = {}
     for i, (g, *_) in enumerate(rows):
@@ -156,6 +200,9 @@ def build_sheet(variant, name):
     for i, row in enumerate(rows):
         emit_row(ws, 2 + i, *row)
     last = 1 + len(rows)
+    # SuperPoint per-image total (multiplied by 2 in grand total)
+    write_total(ws, sp_end, "SuperPoint per image [us] ->",
+                f"=SUM(T2:T{sp_end})")
     # totals (encoder x2, head core x4 baked into block, GNN block x36, Sinkhorn x100)
     enc_rows = [r for r in range(2, last + 1) if ws.cell(r, 1).value
                 and ("KptEnc" in str(ws.cell(r, 1).value) or "Residual desc" in str(ws.cell(r, 1).value))]
@@ -187,10 +234,12 @@ def build_sheet(variant, name):
     # Sinkhorn x T
     write_total(ws, sink_rows[-1], f"Sinkhorn total (x{T}) [us] ->",
                 f"={T}*(SUM(T{sink_rows[0]}:T{sink_rows[-1]}))")
-    # grand total: 2*encoder + GNN + 2*final + score + match scale + Sinkhorn + readout
+    # grand total: 2*SuperPoint (per image x 2) + 2*encoder + GNN + 2*final + score
+    #              + match scale + Sinkhorn + readout
     gt = last + 2
     cstyle(ws.cell(gt, 1, "GRAND TOTAL [us]"), mob.cell(5, 1))
-    grand = (f"=Z{enc_rows[-1]}+Z{block_end}+2*(SUM(T{final_rows[0]}:T{final_rows[-1]}))"
+    grand = (f"=2*Z{sp_end}+Z{enc_rows[-1]}+Z{block_end}"
+             f"+2*(SUM(T{final_rows[0]}:T{final_rows[-1]}))"
              f"+SUM(T{score_rows[0]}:T{score_rows[-1]})+T{scale_match}"
              f"+Z{sink_rows[-1]}+SUM(T{read_rows[0]}:T{read_rows[-1]})")
     write_total(ws, gt, "variant: " + variant, grand)
@@ -213,11 +262,41 @@ def build_measured_sheet():
         if kind == "mac":
             return tiles(c * d) * (R["mac_step"] * K + R["tile_ovh"])
         if kind == "ew":     return tiles(c * d) * R["ew_tile"]
+        if kind == "taps":   return tiles(c * d) * K * R["ew_tile"]
         if kind == "sm":     return d * tiles(c) * R["softmax128"]
         if kind == "sr":     return d * tiles(c) * R["sink_row"]
         if kind == "sc":     return d * tiles(c) * R["sink_col"]
         return 0.0
-    ROWS = [("Input", "kpt+desc load", D, N, 0, "rsh", 1)]
+    ROWS = []
+    # --- SuperPoint (per image; mult=2 for the pair) ---
+    enc_stages = [(IMG_H, IMG_W, [(1, 64, 'conv1a'), (64, 64, 'conv1b')]),
+                  (IMG_H // 2, IMG_W // 2, [(64, 64, 'conv2a'), (64, 64, 'conv2b')]),
+                  (IMG_H // 4, IMG_W // 4, [(64, 128, 'conv3a'), (128, 128, 'conv3b')]),
+                  (IMG_H // 8, IMG_W // 8, [(128, 128, 'conv4a'), (128, 128, 'conv4b')])]
+    for i, (H, W, cs) in enumerate(enc_stages):
+        for cin, cout, name in cs:
+            ROWS.append((f'{name} 3x3+ReLU', 'MAC', cout, H * W, cin * 9, 'mac', 2))
+        if i < len(enc_stages) - 1:
+            outH, outW = H // 2, W // 2
+            ROWS.append((f'maxpool 2x2/s2 -> {outH}x{outW}', 'max(4 taps)',
+                         cs[-1][1], outH * outW, 4, 'taps', 2))
+    Hd, Wd = IMG_H // 8, IMG_W // 8
+    ROWS += [
+        ('convPa 3x3+ReLU', 'MAC', 256, Hd * Wd, 128 * 9, 'mac', 2),
+        ('convPb 1x1 (->65)', 'MAC', 65, Hd * Wd, 256, 'mac', 2),
+        ('detector softmax(65)', 'softmax', 65, Hd * Wd, 0, 'sm', 2),
+        ('depth-to-space', 'reshape', 64, Hd * Wd, 0, 'rsh', 2),
+        ('simple_nms 9x9 iter 3', 'maxpool', IMG_H, IMG_W, 243, 'taps', 2),
+        ('score threshold', 'relu(s-tau)', IMG_H, IMG_W, 0, 'ew', 2),
+        ('topk cap (calibrated)', 'soft count + bisect', IMG_H, IMG_W, 30, 'taps', 2),
+        ('convDa 3x3+ReLU', 'MAC', 256, Hd * Wd, 128 * 9, 'mac', 2),
+        ('convDb 1x1 (->256)', 'MAC', 256, Hd * Wd, 256, 'mac', 2),
+        ('descriptor L2 (dense)', '3 passes', 256, Hd * Wd, 3, 'taps', 2),
+        ('grid_sample (4-corner)', 'MAC', 256, N, 4, 'mac', 2),
+        ('per-keypoint L2', '3 passes', 256, N, 3, 'taps', 2),
+    ]
+    # --- SuperGlue (max-Sinkhorn variant) ---
+    ROWS += [("Input", "kpt+desc load", D, N, 0, "rsh", 1)]
     for cin, cout in [(3, 32), (32, 64), (64, 128), (128, 256)]:
         ROWS.append((f"KptEnc {cin}->{cout}", "MAC matmul", cout, N, cin, "mac", 2))
     ROWS.append(("Residual desc+=enc", "add", D, N, 0, "ew", 2))
@@ -262,7 +341,7 @@ def build_measured_sheet():
         for col, v in vals.items():
             cstyle(ws.cell(r, COLS.index(col) + 1, v), mob.cell(5, COLS.index(col) + 1))
         if mult > 1:
-            ws.cell(r, 25, f"x{mult}")
+            ws.cell(r, 27, f"x{mult}")                # col AA -- don't overwrite Y2 (freq)
     gt = 2 + len(ROWS) + 1
     cstyle(ws.cell(gt, 1, "GRAND TOTAL [us] (measured)"), mob.cell(5, 1))
     write_total(ws, gt, "measured emulator cycles ->", f"=SUM(T2:T{1 + len(ROWS)})")
@@ -277,7 +356,35 @@ def py_total(variant):
     us = lambda cyc: cyc / 1000.0
     mac_us = lambda c, d, K: 2 * us(c * d * K / 128.0)          # mul + add
     ew_us = lambda c, d: us(c * d / 128.0)
-    # Encoder x2
+    # SuperPoint per image (x2 for the pair)
+    sp = 0
+    # ops emitted in the sheet as a SINGLE row with S=c*d*g/128 (one pass per tap)
+    # cost 1x, not 2x (these are max/threshold/sigmoid taps, not MACs)
+    taps_us = lambda c, d, K: K * ew_us(c, d)
+    enc_stages = [(IMG_H, IMG_W, [(1, 64), (64, 64)]),
+                  (IMG_H // 2, IMG_W // 2, [(64, 64), (64, 64)]),
+                  (IMG_H // 4, IMG_W // 4, [(64, 128), (128, 128)]),
+                  (IMG_H // 8, IMG_W // 8, [(128, 128), (128, 128)])]
+    for i, (H, W, cs) in enumerate(enc_stages):
+        for cin, cout in cs:
+            sp += mac_us(cout, H * W, cin * 9)
+        if i < len(enc_stages) - 1:
+            sp += taps_us(cs[-1][1], (H // 2) * (W // 2), 4)     # 2x2/s2 maxpool: 4 taps
+    H, W = IMG_H // 8, IMG_W // 8
+    sp += mac_us(256, H * W, 128 * 9)                            # convPa
+    sp += mac_us(65, H * W, 256)                                 # convPb
+    sp += 5 * ew_us(65, H * W)                                   # detector softmax
+    Hf, Wf = H * 8, W * 8
+    sp += taps_us(Hf, Wf, 243)                                   # simple_nms: 243 taps
+    sp += ew_us(Hf, Wf)                                          # threshold
+    sp += taps_us(Hf, Wf, 30)                                    # topk calibration iters
+    sp += mac_us(256, H * W, 128 * 9)                            # convDa
+    sp += mac_us(256, H * W, 256)                                # convDb
+    sp += 3 * ew_us(256, H * W)                                  # dense L2
+    sp += mac_us(256, N, 4)                                      # grid_sample (real MAC)
+    sp += 3 * ew_us(256, N)                                      # per-kpt L2
+    sp_total = 2 * sp
+    # SuperGlue keypoint encoder x2
     enc = 0
     for cin, cout in [(3, 32), (32, 64), (64, 128), (128, 256)]:
         enc += mac_us(cout, N, cin)
@@ -305,7 +412,7 @@ def py_total(variant):
         read = 2 * ew_us(NP1, NP1)
     else:
         read = 5 * ew_us(NP1, NP1)
-    return enc + gnn + fin + score + scl + sink + read
+    return sp_total + enc + gnn + fin + score + scl + sink + read
 
 
 # ---------------- formula evaluator (for spreadsheet self-check) ------------
