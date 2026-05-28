@@ -264,7 +264,11 @@ def build_measured_sheet():
         if kind == "ew":     return tiles(c * d) * R["ew_tile"]
         if kind == "taps":   return tiles(c * d) * K * R["ew_tile"]
         if kind == "sm":     return d * tiles(c) * R["softmax128"]
-        if kind == "sm_mt":  return d * R["softmax_mt_512"]   # one softmax_mt call per row
+        if kind == "sm_mt":                                    # one softmax_mt call per row
+            nt = tiles(c)
+            if nt <= 1: return d * R["softmax_mt_1"]           # 42 cyc (N <= 128)
+            if nt == 4: return d * R["softmax_mt_4"]           # 88 cyc (N = 512)
+            return d * (30 + nt * 13)                          # linear extrapolation
         if kind == "sr":     return d * tiles(c) * R["sink_row"]
         if kind == "sc":     return d * tiles(c) * R["sink_col"]
         return 0.0
@@ -285,7 +289,7 @@ def build_measured_sheet():
     ROWS += [
         ('convPa 3x3+ReLU', 'MAC', 256, Hd * Wd, 128 * 9, 'mac', 2),
         ('convPb 1x1 (->65)', 'MAC', 65, Hd * Wd, 256, 'mac', 2),
-        ('detector softmax(65)', 'softmax', 65, Hd * Wd, 0, 'sm', 2),
+        ('detector softmax(65)', 'softmax_mt.asm', 65, Hd * Wd, 0, 'sm_mt', 2),
         ('depth-to-space', 'reshape', 64, Hd * Wd, 0, 'rsh', 2),
         ('simple_nms 9x9 iter 3', 'maxpool', IMG_H, IMG_W, 243, 'taps', 2),
         ('score threshold', 'relu(s-tau)', IMG_H, IMG_W, 0, 'ew', 2),

@@ -125,9 +125,11 @@ def rates():
     sm = measure_softmax(128)                               # cyc per 128-lane softmax row
     sr = measure_sink_row(64) / 64.0                        # cyc per row, row half-step (<=128 col)
     sc = measure_sink_col(64) / 64.0                        # cyc per row, col half-step (<=128 col)
-    smt = measure_softmax_mt(512)                           # cyc for one N=512 softmax_mt call
+    smt1 = measure_softmax_mt(128)                          # cyc for one ntiles=1 (N<=128) softmax_mt
+    smt4 = measure_softmax_mt(512)                          # cyc for one ntiles=4 (N=512) softmax_mt
     return {"mac_step": a, "tile_ovh": b, "ew_tile": ew, "softmax128": sm,
-            "softmax_mt_512": smt, "sink_row": sr, "sink_col": sc}
+            "softmax_mt_1": smt1, "softmax_mt_4": smt4,
+            "sink_row": sr, "sink_col": sc}
 
 
 if __name__ == "__main__":
