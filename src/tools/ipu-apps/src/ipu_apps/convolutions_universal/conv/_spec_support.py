@@ -1,15 +1,32 @@
 """Shared helpers for the conv2d kernels' registry declarations.
 
 Every ``conv2d`` kernel answers the same query -- an activation shape, a weight
-shape, and the four geometry parameters (``stride``/``padding``/``dilation``/
-``groups``) -- so the parameter unpacking, the XMEM budget arithmetic and the
-constants they reason about live here rather than being repeated per kernel.
+shape, the four geometry parameters (``stride``/``padding``/``dilation``/
+``groups``) and the fused activation function -- so the parameter unpacking,
+the XMEM budget arithmetic and the constants they reason about live here rather
+than being repeated per kernel.
 
 Unlike softmax, a conv query is genuinely multi-tensor: the input, the weight,
 the optional bias and the derived output all travel in one
 :class:`~ipu_apps.kernel_registry.shapes.ShapeBundle`. Note that
 ``flatten_to_matrix`` is *not* used and must not be -- it is built around a
 single reduction axis and raises on an interior one, which is every conv.
+
+Two dataclasses, deliberately separate:
+
+``ConvQuery``   what the caller asked for. Shapes and geometry, nothing about
+                how a kernel would lay it out in XMEM.
+``ConvLayout``  how one kernel would lay that out. Built with
+                :meth:`ConvQuery.layout`, which takes the two things kernels
+                actually differ on -- how many of a 128-element XMEM row are
+                valid output columns, and how many zero rows border a plane.
+
+The split matters because the pointwise and shifted-tap kernels genuinely
+disagree: 1x1 reads one element per output element, so all 128 lanes are
+usable and no border is needed; 3x3 spends one element at each end of a row on
+the horizontal halo and needs a zero row above and below. Sharing the budget
+arithmetic while parameterising those two numbers keeps one copy of the
+XMEM accounting.
 
 The framework-layer adapters live here too, for the same reason the specs live
 beside their kernels: the op-agnostic registry should carry no conv vocabulary.
@@ -42,6 +59,14 @@ XMEM_ROWS = (8 << 20) // ROW_BYTES  # 16384
 # zero is then detectably wrong rather than silently landing in the input.
 BASE_ROW = 64
 
+# Activation functions a conv kernel can fuse into its ACTIVATE.QUANTIZE.
+# ACTIVATE.QUANTIZE takes the function as an *immediate*, not a CR, so it is
+# fixed when the .asm is assembled -- a kernel implements exactly one, and the
+# query has to say which is wanted or the registry would hand a caller asking
+# for a plain convolution one that also applies ReLU.
+NO_ACTIVATION = "none"
+KNOWN_ACTIVATIONS = (NO_ACTIVATION, "relu")
+
 WIDE_VECTOR_ONLY = (
     "Wide-vector FP32 debug mode only (wide_vector_debug=True). These apps "
     "accumulate in FP32 through ACTIVATE.QUANTIZE and have no narrow "
@@ -50,82 +75,76 @@ WIDE_VECTOR_ONLY = (
 
 
 @dataclass(frozen=True)
-class ConvQuery:
-    """A conv2d query reduced to what the kernels route on.
+class ConvLayout:
+    """How one kernel would place a query's tensors in XMEM, in 128-element rows.
 
     Attributes:
-        batch:   Leading batch extent (1 for a rank-3 ``(Cin, H, W)`` query).
-        cin:     Input channels.
-        cout:    Output channels.
-        height:  Input rows.
-        width:   Input columns.
-        kh, kw:  Weight spatial extent.
-        stride, padding, dilation, groups: Convolution geometry.
-        bias:    Whether a bias vector is present.
-        weight_cin: The weight's declared input-channel extent, which must
-            equal ``cin // groups``. Kept separate so a mismatch is reported
-            rather than assumed away.
-        bundle:  The role-keyed shape bundle for the verdict.
+        query:     The query being laid out.
+        tile_cols: Valid output columns per XMEM row. 128 when every lane is a
+            usable output; fewer when the kernel spends lanes on a halo.
+        pad_rows:  Zero rows added above *and* below each input plane, so a
+            kernel reading a vertical neighbourhood needs no border special
+            case. 0 for a kernel with no vertical window.
+        weights_per_channel: Weight elements one input channel contributes to
+            one output channel (``kh*kw``). Sets the channel-group size, since
+            one ``LDR_MULT_REG`` row holds 128 of them.
     """
 
-    batch: int
-    cin: int
-    cout: int
-    height: int
-    width: int
-    kh: int
-    kw: int
-    stride: int
-    padding: int
-    dilation: int
-    groups: int
-    bias: bool
-    weight_cin: int
-    bundle: ShapeBundle
-
-    # -- derived XMEM geometry (all in 128-element rows) --------------------
+    query: "ConvQuery"
+    tile_cols: int
+    pad_rows: int
+    weights_per_channel: int
 
     @property
     def tiles_per_row(self) -> int:
-        """Column tiles per spatial row: ``ceil(width / 128)``.
-
-        A spatial row occupies whole XMEM rows because addressing is
-        row-granular, so a width that is not a multiple of 128 pads with idle
-        lanes rather than packing tightly.
-        """
-        return (self.width + LANES - 1) // LANES
+        """XMEM rows per spatial row: ``ceil(W / tile_cols)``."""
+        return (self.query.width + self.tile_cols - 1) // self.tile_cols
 
     @property
-    def plane_stride(self) -> int:
-        """Rows per channel plane -- the same for input and output."""
-        return self.height * self.tiles_per_row
+    def padded_height(self) -> int:
+        """Input plane rows including the zero border above and below."""
+        return self.query.height + 2 * self.pad_rows
+
+    @property
+    def in_plane_stride(self) -> int:
+        """Rows per input channel plane (border included)."""
+        return self.padded_height * self.tiles_per_row
+
+    @property
+    def out_plane_stride(self) -> int:
+        """Rows per output channel plane (no border)."""
+        return self.query.height * self.tiles_per_row
+
+    @property
+    def group_cap(self) -> int:
+        """Input channels whose weights fit one 128-element ``R0`` row."""
+        return LANES // self.weights_per_channel
 
     @property
     def num_groups(self) -> int:
-        """Channel groups: one ``LDR_MULT_REG`` row of weights covers 128 channels."""
-        return (self.cin + LANES - 1) // LANES
+        return (self.query.cin + self.group_cap - 1) // self.group_cap
 
     @property
     def input_rows(self) -> int:
-        """Input region size, including the one guard plane the prefetch reads.
+        """Input region, including the one guard plane the prefetch reads.
 
-        The channel loop is software-pipelined: the last iteration prefetches
-        channel ``cin``, whose data is never consumed but whose row must still
-        be in bounds.
+        The channel loop is software-pipelined or reads one channel ahead, so
+        its last iteration touches channel ``cin``, whose data is never
+        consumed but whose row must still be in bounds.
         """
-        return (self.cin + 1) * self.plane_stride
+        return (self.query.cin + 1) * self.in_plane_stride
 
     @property
     def weight_rows(self) -> int:
-        return self.cout * self.num_groups
+        return self.query.cout * self.num_groups
 
     @property
     def bias_rows(self) -> int:
-        return self.cout
+        return self.query.cout
 
     @property
     def output_rows(self) -> int:
-        return self.cout * self.plane_stride
+        return self.query.cout * self.out_plane_stride
 
     @property
     def total_rows(self) -> int:
@@ -140,16 +159,61 @@ class ConvQuery:
 
     @property
     def max_band_height(self) -> int:
-        """Largest ``height`` that would fit the XMEM budget at this width/channels.
+        """Largest ``height`` that would fit the budget at this width/channels.
 
         Reported in the over-budget refusal so the caller learns how to tile
         rather than only that it failed. Zero when even a single row overflows.
         """
-        per_row = self.tiles_per_row * ((self.cin + 1) + self.cout)
+        per_row = self.tiles_per_row * ((self.query.cin + 1) + self.query.cout)
         if per_row < 1:
             return 0
-        fixed = BASE_ROW + self.weight_rows + self.bias_rows
+        border = (self.query.cin + 1) * 2 * self.pad_rows * self.tiles_per_row
+        fixed = BASE_ROW + self.weight_rows + self.bias_rows + border
         return max(0, (XMEM_ROWS - fixed) // per_row)
+
+
+@dataclass(frozen=True)
+class ConvQuery:
+    """A conv2d query reduced to what the kernels route on.
+
+    Attributes:
+        batch:      Leading batch extent (1 for a rank-3 ``(Cin, H, W)`` query).
+        cin, cout:  Input and output channels.
+        height, width: Input spatial extent.
+        kh, kw:     Weight spatial extent.
+        stride, padding, dilation, groups: Convolution geometry.
+        bias:       Whether a bias vector is present.
+        activation: Activation fused into the kernel's store, or ``"none"``.
+        weight_cin: The weight's declared input-channel extent, which must
+            equal ``cin // groups``. Kept separate so a mismatch is reported
+            rather than assumed away.
+        bundle:     The role-keyed shape bundle for the verdict.
+    """
+
+    batch: int
+    cin: int
+    cout: int
+    height: int
+    width: int
+    kh: int
+    kw: int
+    stride: int
+    padding: int
+    dilation: int
+    groups: int
+    bias: bool
+    activation: str
+    weight_cin: int
+    bundle: ShapeBundle
+
+    def layout(self, *, tile_cols: int, pad_rows: int) -> ConvLayout:
+        """Describe how a kernel with this tiling would place the tensors."""
+        return ConvLayout(
+            query=self,
+            tile_cols=tile_cols,
+            pad_rows=pad_rows,
+            weights_per_channel=self.kh * self.kw,
+        )
 
 
 def _spatial_pair(value, name: str) -> tuple[int, int]:
@@ -174,6 +238,7 @@ def conv_query(
     dilation,
     groups,
     bias: bool = True,
+    activation: str = NO_ACTIVATION,
 ) -> ConvQuery:
     """Normalise a conv2d query into the form every conv kernel routes on.
 
@@ -183,9 +248,10 @@ def conv_query(
     computing the first image only.
 
     Raises:
-        MalformedQuery: if the shapes are structurally not a convolution --
-            wrong rank, or a non-pair geometry attribute. Those are mistakes in
-            the question, which no kernel could answer.
+        MalformedQuery: if the query is structurally not a convolution --
+            wrong rank, a non-pair geometry attribute, a non-positive stride,
+            or an unknown activation name. Those are mistakes in the question,
+            which no kernel could answer.
     """
     dims = tuple(int(d) for d in shape)
     if len(dims) == 3:
@@ -205,6 +271,12 @@ def conv_query(
             f"rank-{len(wdims)} {wdims}"
         )
     cout, weight_cin, kh, kw = wdims
+
+    if activation not in KNOWN_ACTIVATIONS:
+        raise MalformedQuery(
+            f"unknown activation {activation!r}; conv2d kernels fuse one of "
+            f"{', '.join(repr(a) for a in KNOWN_ACTIVATIONS)}"
+        )
 
     sh, sw = _spatial_pair(stride, "stride")
     ph, pw = _spatial_pair(padding, "padding")
@@ -247,6 +319,7 @@ def conv_query(
         dilation=dh,
         groups=int(groups),
         bias=bool(bias),
+        activation=activation,
         weight_cin=weight_cin,
         bundle=bundle,
     )
@@ -258,10 +331,10 @@ def geometry_refusal(q: ConvQuery) -> str | None:
     These are the checks shared by all conv2d kernels -- non-positive extents,
     a weight that disagrees with the input, and the geometry parameters none of
     them implement. A kernel's own ``supports`` adds its specific limits (its
-    kernel size, its XMEM budget) on top.
+    kernel size, its activation, its XMEM budget) on top.
 
-    Enumerating stride/padding/dilation/groups here rather than assuming them
-    is the point: a conv spec that silently ignores ``stride=2`` would answer
+    Enumerating stride/dilation/groups here rather than assuming them is the
+    point: a conv spec that silently ignored ``stride=2`` would answer
     confidently for an operation no kernel computes.
     """
     if q.batch != 1:
@@ -296,41 +369,67 @@ def geometry_refusal(q: ConvQuery) -> str | None:
     return None
 
 
-def xmem_refusal(q: ConvQuery) -> str | None:
-    """Refuse a query whose regions do not fit the wide-vector XMEM budget."""
-    if q.total_rows <= XMEM_ROWS:
+def activation_refusal(q: ConvQuery, implemented: str) -> str | None:
+    """Refuse a query whose fused activation is not the one this kernel applies.
+
+    ``ACTIVATE.QUANTIZE`` takes its function as an immediate, so a kernel
+    implements exactly one and cannot be asked for another at run time. Routing
+    across that difference would return confidently wrong values -- a caller
+    asking for a plain convolution would get one with ReLU folded in.
+    """
+    if q.activation == implemented:
         return None
-    band = q.max_band_height
+    if implemented == NO_ACTIVATION:
+        return (
+            f"applies no activation; this query asks for {q.activation!r} fused "
+            f"into the store. ACTIVATE.QUANTIZE takes its function as an "
+            f"immediate, so it is fixed when the .asm is assembled."
+        )
+    return (
+        f"fuses {implemented!r} into its store and cannot be asked for "
+        f"{q.activation!r}; ACTIVATE.QUANTIZE takes its function as an "
+        f"immediate, so it is fixed when the .asm is assembled."
+    )
+
+
+def xmem_refusal(layout: ConvLayout) -> str | None:
+    """Refuse a query whose regions do not fit the wide-vector XMEM budget."""
+    if layout.total_rows <= XMEM_ROWS:
+        return None
+    band = layout.max_band_height
     advice = (
         f"Tile the input into row bands of at most {band} rows."
         if band >= 1
         else "Even a single row does not fit; reduce the channel count or width."
     )
     return (
-        f"needs {q.total_rows} XMEM rows (input {q.input_rows} incl. 1 guard "
-        f"plane + weights {q.weight_rows} + bias {q.bias_rows} + output "
-        f"{q.output_rows} + {BASE_ROW} reserved); wide-vector XMEM holds "
-        f"{XMEM_ROWS} rows of {ROW_BYTES} B. {advice}"
+        f"needs {layout.total_rows} XMEM rows (input {layout.input_rows} incl. "
+        f"1 guard plane + weights {layout.weight_rows} + bias "
+        f"{layout.bias_rows} + output {layout.output_rows} + {BASE_ROW} "
+        f"reserved); wide-vector XMEM holds {XMEM_ROWS} rows of {ROW_BYTES} B. "
+        f"{advice}"
     )
 
 
-def lane_caveat(q: ConvQuery) -> str | None:
-    """Quantify the idle lanes a non-multiple-of-128 width costs."""
-    padded = q.tiles_per_row * LANES
-    if padded == q.width:
+def lane_caveat(layout: ConvLayout) -> str | None:
+    """Quantify the lanes a width that does not fill its tiles leaves idle."""
+    usable = layout.tiles_per_row * layout.tile_cols
+    total = layout.tiles_per_row * LANES
+    if usable == layout.query.width and total == usable:
         return None
     return (
-        f"width {q.width} pads to {padded} elements per spatial row; "
-        f"{padded - q.width} of every {padded} lanes idle "
-        f"({q.width / padded:.0%} datapath utilisation)"
+        f"width {layout.query.width} occupies {layout.tiles_per_row} XMEM row(s) "
+        f"per spatial row ({total} lanes, {layout.tile_cols} usable each); "
+        f"{total - layout.query.width} lanes idle "
+        f"({layout.query.width / total:.0%} datapath utilisation)"
     )
 
 
-def headroom_caveat(q: ConvQuery) -> str:
+def headroom_caveat(layout: ConvLayout) -> str:
     """Report the XMEM rows this query leaves unused."""
     return (
-        f"uses {q.total_rows} of {XMEM_ROWS} XMEM rows "
-        f"({XMEM_ROWS - q.total_rows} free)"
+        f"uses {layout.total_rows} of {XMEM_ROWS} XMEM rows "
+        f"({XMEM_ROWS - layout.total_rows} free)"
     )
 
 
@@ -345,6 +444,10 @@ def _conv2d_layer(layer, input_shape):
     ones it cannot express, rather than ignoring them: a layer with
     ``padding='same'`` or a reflect padding mode computes something no conv
     kernel here implements, and answering for it would be confidently wrong.
+
+    Emits ``activation="none"``, because a bare ``nn.Conv2d`` applies none. A
+    fused conv+ReLU is two layers in torch, and this adapter sees one at a
+    time -- it cannot know a ReLU follows, so it must not assume one does.
     """
     expected = (
         "in_channels",
@@ -386,6 +489,7 @@ def _conv2d_layer(layer, input_shape):
         "dilation": layer.dilation,
         "groups": int(layer.groups),
         "bias": getattr(layer, "bias", None) is not None,
+        "activation": NO_ACTIVATION,
     }
 
 

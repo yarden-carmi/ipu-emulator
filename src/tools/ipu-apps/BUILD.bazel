@@ -177,6 +177,19 @@ py_pytest_test(
     ],
 )
 
+py_pytest_test(
+    name = "test_conv3x3_relu_fp32",
+    srcs = ["test/test_conv3x3_relu_fp32.py"],
+    data = [
+        "src/ipu_apps/convolutions_universal/conv/conv3x3_relu_fp32/conv3x3_relu_fp32.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
 # Router only -- no .asm needed; it constructs apps but never runs them.
 py_pytest_test(
     name = "test_softmax_registry",

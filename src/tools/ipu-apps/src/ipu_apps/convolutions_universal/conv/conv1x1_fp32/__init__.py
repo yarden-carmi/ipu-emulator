@@ -59,8 +59,10 @@ from ipu_apps.kernel_registry import KernelSpec, no, yes
 from ipu_apps.convolutions_universal.conv._spec_support import (
     BASE_ROW,
     LANES,
+    NO_ACTIVATION,
     ROW_BYTES,
     WIDE_VECTOR_ONLY,
+    activation_refusal,
     conv_query,
     geometry_refusal,
     headroom_caveat,
@@ -72,6 +74,16 @@ from ipu_apps.convolutions_universal.conv._spec_support import (
 # thing a channel-space dot product; a larger window needs the shifted-tap
 # kernel, not a parameter here.
 KERNEL_SIZE = 1
+
+# Every lane of a 128-element row is a usable output column: a 1x1 kernel reads
+# exactly one input element per output element, so there is no halo to spend
+# lanes on and no vertical border to add.
+TILE_COLS = LANES
+PAD_ROWS = 0
+
+# This kernel stores through ACTIVATE.QUANTIZE identity -- a plain FP32
+# pass-through, no activation folded in.
+ACTIVATION = NO_ACTIVATION
 
 
 class Conv1x1Fp32App(IpuApp):
@@ -127,6 +139,7 @@ class Conv1x1Fp32App(IpuApp):
             dilation=1,
             groups=1,
             bias=self.has_bias,
+            activation=ACTIVATION,
         )
         # The same query object the spec reasoned about, so the harness and the
         # registry cannot disagree about region sizes.
@@ -138,6 +151,7 @@ class Conv1x1Fp32App(IpuApp):
             dilation=1,
             groups=1,
             bias=self.has_bias,
+            activation=ACTIVATION,
         )
         self._layout()
 
@@ -149,16 +163,17 @@ class Conv1x1Fp32App(IpuApp):
         teardown, which bypass row translation. Keeping both explicit is what
         stops the two units being confused.
         """
-        q = self.query
-        self.tiles_per_row = q.tiles_per_row
-        self.plane_stride = q.plane_stride
-        self.num_groups = q.num_groups
-        self.output_rows = q.output_rows
+        lay = self.query.layout(tile_cols=TILE_COLS, pad_rows=PAD_ROWS)
+        self.geometry = lay
+        self.tiles_per_row = lay.tiles_per_row
+        self.plane_stride = lay.in_plane_stride
+        self.num_groups = lay.num_groups
+        self.output_rows = lay.output_rows
 
         self.input_base_row = BASE_ROW
-        self.weight_base_row = self.input_base_row + q.input_rows
-        self.bias_base_row = self.weight_base_row + q.weight_rows
-        self.output_base_row = self.bias_base_row + q.bias_rows
+        self.weight_base_row = self.input_base_row + lay.input_rows
+        self.bias_base_row = self.weight_base_row + lay.weight_rows
+        self.output_base_row = self.bias_base_row + lay.bias_rows
 
         self.input_base = self.input_base_row * ROW_BYTES
         self.weight_base = self.weight_base_row * ROW_BYTES
@@ -284,7 +299,12 @@ def _query(params):
         dilation=params["dilation"],
         groups=params["groups"],
         bias=params.get("bias", True),
+        activation=params.get("activation", NO_ACTIVATION),
     )
+
+
+def _geometry(params):
+    return _query(params).layout(tile_cols=TILE_COLS, pad_rows=PAD_ROWS)
 
 
 def _supports(**params):
@@ -307,7 +327,10 @@ def _supports(**params):
             f"{q.height + 2 * q.padding} x {q.width + 2 * q.padding} with a "
             f"border this kernel does not write"
         )
-    budget = xmem_refusal(q)
+    bad = activation_refusal(q, ACTIVATION)
+    if bad:
+        return no(bad)
+    budget = xmem_refusal(q.layout(tile_cols=TILE_COLS, pad_rows=PAD_ROWS))
     if budget:
         return no(budget)
     return yes()
@@ -325,22 +348,22 @@ def _build(**params):
 
 
 def _explain(**params):
-    q = _query(params)
+    lay = _geometry(params)
     return (
         f"a {KERNEL_SIZE}x{KERNEL_SIZE} convolution is a channel-space dot "
         f"product at every position, so all {LANES} lanes of a tile reduce "
-        f"independently; {q.cin} input channels run as {q.num_groups} exact "
-        f"group(s) of at most {LANES}"
+        f"independently; {lay.query.cin} input channels run as "
+        f"{lay.num_groups} exact group(s) of at most {lay.group_cap}"
     )
 
 
 def _caveats(**params):
-    q = _query(params)
+    lay = _geometry(params)
     notes = [WIDE_VECTOR_ONLY]
-    lanes = lane_caveat(q)
+    lanes = lane_caveat(lay)
     if lanes:
         notes.append(lanes)
-    notes.append(headroom_caveat(q))
+    notes.append(headroom_caveat(lay))
     return tuple(notes)
 
 

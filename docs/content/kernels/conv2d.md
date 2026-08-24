@@ -1,22 +1,52 @@
 # Convolution
 
-One kernel so far: `conv1x1_fp32`, a pointwise (1×1) FP32 convolution over a
-`(Cin, H, W)` activation. It is **wide-vector FP32 mode only**
-(`wide_vector_debug=True`) and has no narrow (INT8/FP8) variant.
+Two kernels, both over a `(Cin, H, W)` activation, both **wide-vector FP32
+mode only** (`wide_vector_debug=True`) with no narrow (INT8/FP8) variant:
 
-## What it computes
+| Kernel | Computes | Fused activation |
+|---|---|---|
+| `conv1x1_fp32` | pointwise (1×1), stride 1, no padding | none |
+| `conv3x3_relu_fp32` | 3×3, stride 1, zero-padded by 1 | **ReLU** |
+
+Both loop over output channels internally, so one launch produces the whole
+`(Cout, H, W)` result.
+
+## What they compute
 
 ```
-out[o, y, x] = bias[o] + SUM_ci W[o, ci] * in[ci, y, x]
+conv1x1_fp32        out[o,y,x] =      bias[o] + SUM_ci W[o,ci] * in[ci,y,x]
+
+conv3x3_relu_fp32   out[o,y,x] = relu(bias[o] + SUM_ci SUM_kr SUM_kc
+                                      W[o,ci,kr,kc] * in[ci, y+kr, x+kc])
 ```
 
 A 1×1 convolution has no spatial window, so every output element is a pure
-channel-space dot product and all 128 lanes of a tile reduce independently.
-That collapses the whole kernel to a single accumulation loop over input
-channels — no taps, no border, no mask.
+channel-space dot product and all 128 lanes of a tile reduce independently —
+one accumulation loop over input channels, no taps, no border, no mask.
 
-The kernel loops over output channels internally, so one launch produces the
-whole `(Cout, H, W)` result.
+The 3×3 kernel adds the nine taps and the zero border. Its ReLU is **fused and
+not optional**; see below.
+
+## The activation is part of the query
+
+`ACTIVATE.QUANTIZE` takes its activation function as an **immediate**, not a
+CR, so it is fixed when the `.asm` is assembled. A kernel implements exactly
+one activation and cannot be asked for another at run time.
+
+That makes `activation` a query parameter rather than a detail:
+
+```python
+resolve("conv2d", ..., activation="relu")   # -> conv3x3_relu_fp32
+resolve("conv2d", ..., activation="none")   # -> conv1x1_fp32 (1x1 only)
+```
+
+Omitting it means `"none"`. A caller asking for a plain 3×3 convolution is
+**refused**, not handed the ReLU kernel — that would be a confidently wrong
+answer rather than a near miss. There is currently no 3×3 kernel without ReLU.
+
+The `Conv2d` layer adapter emits `activation="none"`, because a bare
+`nn.Conv2d` applies none. A fused conv+ReLU is two layers in torch and the
+adapter sees one at a time, so it cannot assume a ReLU follows.
 
 ## Picking one
 
@@ -37,7 +67,7 @@ that apply at that shape (idle lanes, XMEM headroom).
 
 ### What is refused, and why
 
-The registry refuses anything outside this kernel's domain with the offending
+The registry refuses anything outside these kernels' domain with the offending
 value named. `stride`, `padding`, `dilation` and `groups` are **required**
 query parameters rather than assumed defaults: a conv spec that silently
 ignored `stride=2` would answer confidently for an operation no kernel here
@@ -45,12 +75,13 @@ computes.
 
 | Refused | Reason |
 |---|---|
-| a `kh`×`kw` window other than 1×1 | needs the shifted-tap kernel, not migrated yet |
+| a `kh`×`kw` window other than 1×1 or 3×3 | no kernel |
 | `stride` ≠ 1 | no kernel subsamples |
-| `padding` ≠ 0 | a 1×1 kernel reads exactly one input element per output element, so padding only grows the output with a border this kernel never writes |
-| `dilation` ≠ 1 | meaningless for a 1×1 window |
+| `padding` mismatched to the window | 1×1 needs `padding=0` (it reads one input element per output element, so padding only grows the output with a border it never writes); 3×3 needs `padding=1`, the value that keeps the output `H × W` |
+| `dilation` ≠ 1 | no kernel dilates |
 | `groups` ≠ 1 | grouped and depthwise convolution is a different dataflow |
 | a batch extent > 1 | one image per launch |
+| an activation no kernel fuses | see above |
 | regions over the XMEM budget | reported with the row arithmetic and the largest row band that would fit |
 
 `ConvTranspose2d`, `Conv1d` and `Conv3d` are refused explicitly rather than
@@ -60,25 +91,54 @@ adapter would return confidently wrong numbers.
 ## Memory layout
 
 XMEM operands are **row numbers**, not byte addresses. One row is 128 elements
-= 512 bytes in wide-vector debug mode, and XMEM holds 16384 such rows. Every
-region below is therefore sized in rows, with `NCT = ceil(W / 128)` column
-tiles per spatial row and `NGROUPS = ceil(Cin / 128)` channel groups:
+= 512 bytes in wide-vector debug mode, and XMEM holds 16384 such rows. Both
+kernels share the same four regions, differing only in two numbers: how many
+of a row's 128 lanes are usable output columns (`TC`), and how many zero rows
+border a plane (`PAD`).
+
+| | `TC` | `PAD` | weights/channel | group cap |
+|---|---|---|---|---|
+| `conv1x1_fp32` | 128 | 0 | 1 | 128 |
+| `conv3x3_relu_fp32` | 126 | 1 | 9 | 14 |
+
+With `TPR = ceil(W / TC)` rows per spatial row and `NGROUPS = ceil(Cin / cap)`:
 
 | Region | CR | Size (rows) | Layout |
 |---|---|---|---|
-| input | `CR2` | `(Cin + 1) * H * NCT` | channel-major planes; spatial row `y` at `+y*NCT`, one row per column tile |
-| weight | `CR4` | `Cout * NGROUPS` | row `o*NGROUPS + g` holds `W[o, g*128 : (g+1)*128]` |
+| input | `CR2` | `(Cin + 1) * (H + 2*PAD) * TPR` | channel-major planes; padded spatial row `r` at `+r*TPR`, one row per column tile |
+| weight | `CR4` | `Cout * NGROUPS` | row `o*NGROUPS + g` holds one group's weights, `weights/channel` consecutive elements each |
 | bias | `CR5` | `Cout` | one row per output channel, `bias[o]` in element 0 |
-| output | `CR3` | `Cout * H * NCT` | same plane layout as the input |
+| output | `CR3` | `Cout * H * TPR` | same tiling, no border |
 
-Because addressing is row-granular, a spatial row shorter than `NCT*128` pads
-with idle lanes. There is no tighter packing available — and correspondingly
-none of the byte-level tight packing, guard row and last-tile spill handling
-that a byte-addressed kernel would need. The harness slices the padding back
-off in `teardown`, so the output file is a dense `(Cout, H, W)` FP32 array in
-the same element order as the input.
+The `+1` on the input region is a **guard plane** — the pointwise kernel's
+pipelined channel loop prefetches one channel past the end, and the 3×3 kernel
+reserves it so the same is safe there.
 
-The `+1` on the input region is one **guard plane**; see the channel loop below.
+The harness trims the unusable lanes in `teardown`, so the output file is a
+dense `(Cout, H, W)` FP32 array in the same element order as the input.
+
+### Halo tiling (3×3)
+
+A load reaches a whole 128-element row and cannot shift by one element, so a
+3×3 kernel cannot get its horizontal taps from shifted *loads* the way a
+byte-addressed one did. Instead each tile stores its own horizontal halo:
+
+```
+element  0        = input column (t*126 - 1)      <- left halo
+elements 1..126   = input columns t*126 .. t*126+125
+element  127      = input column (t*126 + 126)    <- right halo
+```
+
+Output lane `j` (0..125) is column `t*126 + j`, and tap `kc` reads element
+`j + kc + 1` — so every tap of every valid lane is satisfied from inside the
+one row, with no neighbouring-tile dependency. Columns outside the image are
+stored as zero, which *is* the convolution's zero padding. Lanes 126 and 127
+read past the slot and are discarded.
+
+**The vertical border then costs nothing.** Each plane carries an all-zero row
+band above and below (`H + 2` spatial rows), so output row `y` reads padded
+rows `y`, `y+1`, `y+2` unconditionally. There is no top/bottom special case
+anywhere in the kernel — the zero rows *are* the padding.
 
 ### CR map
 
@@ -89,18 +149,20 @@ for the bias broadcast and every `+1` increment.
 | CR | Value |
 |---|---|
 | `CR2`–`CR5` | input / output / weight / bias base row |
-| `CR6` | `H * NCT` — rows per channel plane, input and output alike |
-| `CR7` | `NCT` — rows per spatial row, and the column-tile loop bound |
+| `CR6` | 1×1: `H * TPR`, rows per channel plane. 3×3: `H * TPR`, the walk from padded row `(y+2, t)` of one channel to `(y, t)` of the next — which is `(H+2)*TPR - 2*TPR`, the same number |
+| `CR7` | `TPR` — rows per spatial row, and the tile-loop bound |
 | `CR8` | `H` |
 | `CR9` | `Cin` |
 | `CR10` | `Cout` |
 | `CR11` | `NGROUPS` — also the per-output-channel weight-row advance |
-| `CR12` | `128` — the channel-group cap, and the `Ra` element index selecting `R1[0]` |
+| `CR12` | `128` — the `Ra` element index selecting `R1[0]`; also the 1×1 group cap and the 3×3 `R_CYCLIC` slot-1 index |
+| `CR13` | 3×3 only: `14`, the channel-group cap |
+| `CR14` | 3×3 only: `126`, the tap walk's slot-to-slot step |
 | `CR15` | dstructure (`valid_elements = 128`) |
 
 The group weight stride is one row, which is `CR1` — it needs no CR of its own.
-`CR6 = CR8 * CR7` is precomputed by the harness because the LR slot has no
-multiply.
+`CR6` is precomputed by the harness because the LR slot has no multiply. The
+3×3 kernel uses all 16 CRs.
 
 ## Two techniques worth knowing
 
@@ -147,14 +209,36 @@ operand is resolved live inside the handler, so the same-word increment lands
 before the read. The `-1` is never itself read; the LR add wraps
 `0xFFFFFFFF → 0`.
 
+### The walking tap index (3×3)
+
+`MULT.RC.*` reads `R_CYCLIC` at an arbitrary **element** index and may cross
+slot boundaries. That is what lets the horizontal shift live in the register
+rather than in the load. Three vertically-neighbouring rows occupy slots 0, 1
+and 2, and one walking index steps through all nine taps in weight order:
+
+```
+tap  1  2  3    4    5    6    7    8    9
+rc   0  1  2  128  129  130  256  257  258
+step +1 +1 +1 +126  +1   +1  +126  +1   +1
+```
+
+Only two step constants, `CR1` (=1) and `CR14` (=126). `rc_idx` is read live,
+so the same-word add lands before the read and the index is seeded to `-1`.
+A second index walks `+1` in lockstep through `R0`, which is why the weights
+are simply `W[o, ci].ravel()` — `(kr, kc)` row-major, nine per channel.
+
 ### Exact channel groups
 
-One `LDR_MULT_REG` row holds 128 FP32 weights and a 1×1 kernel needs one weight
-per channel, so a group covers up to 128 channels — not the 14 the older 3×3
-kernel was limited to, which was a taps-per-row limit rather than a width one.
-The group size is computed exactly as `min(128, Cin - done)`, so a 129-channel
-input runs 128 then 1, with no padding. `R_ACC` is never reset between groups;
-the accumulation simply continues, which is what makes an arbitrary `Cin` work.
+One `LDR_MULT_REG` row holds 128 FP32 weights. A 1×1 kernel needs one weight
+per channel, so a group covers up to **128** channels; the 3×3 kernel needs
+nine, so a group covers **14** (126 of 128 elements used). That 14 is a
+taps-per-row limit, not a width one — it is unchanged by FP32, and it is why
+the pointwise kernel is not similarly capped.
+
+Either way the group size is computed exactly as `min(cap, Cin - done)`, so a
+129-channel pointwise input runs 128 then 1 with no padding. `R_ACC` is never
+reset between groups; the accumulation simply continues, which is what makes an
+arbitrary `Cin` work.
 
 ## Slot ordering
 
@@ -168,10 +252,15 @@ depends on:
 - `BLT` reads the start-of-word snapshot, so a counter incremented in the
   previous word is already advanced when the branch sees it.
 
-## Not yet migrated
+## Not yet covered
 
-The 3×3 shifted-tap kernel (`conv_fp32_full`, with ReLU) reuses this package
-and CR map. Its additional work is the nine-tap walking pointer through
-`R_CYCLIC`, the one-pixel border, and a `relu` activation — which needs a
-separate `.asm`, since `ACTIVATE.QUANTIZE`'s function is an immediate rather
-than a CR and so cannot be selected at run time.
+- **A 3×3 convolution without ReLU.** It needs its own `.asm` (the activation
+  is an assembly-time immediate), not a flag.
+- **Strided, dilated, grouped and depthwise convolutions**, and window sizes
+  other than 1×1 and 3×3. All are refused by name rather than approximated.
+- **Row-band tiling for inputs over the XMEM budget.** The refusal already
+  reports the largest band that would fit, but the host has to do the banding.
+- **Pipelining the 3×3 channel loop.** It currently spends 14 words per input
+  channel: three row loads, a pointer walk, and the nine taps. Issuing the next
+  channel's loads inside the current channel's taps — slot 0 is dead from tap 4
+  and slot 1 from tap 7 — would bring that to about 10.

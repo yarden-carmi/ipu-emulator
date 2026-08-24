@@ -12,7 +12,7 @@ add more.
 | Page | What it answers |
 |---|---|
 | [Softmax](softmax.md) | Which softmax kernels exist, which shape each handles, and what they cost |
-| [Convolution](conv2d.md) | The pointwise FP32 kernel, its memory layout, and what the router refuses |
+| [Convolution](conv2d.md) | The pointwise and 3×3 FP32 kernels, their memory layout, and what the router refuses |
 | [Application coverage](../app-coverage.md) | How the emulator knows which kernel implements a computation |
 | [Adding applications](../adding-applications.md) | How to contribute a kernel |
 
@@ -45,7 +45,7 @@ covers the shape, what each candidate objected to.
 | Operation | Kernels |
 |---|---|
 | `softmax` | 5 — see [Softmax](softmax.md) |
-| `conv2d` | 1 — see [Convolution](conv2d.md) |
+| `conv2d` | 2 — see [Convolution](conv2d.md) |
 
 Depthwise and fully-connected applications exist in the tree but are not yet
 registered; they are used directly rather than through the registry. See
