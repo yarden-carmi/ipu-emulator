@@ -6,16 +6,25 @@ from ipu_common.incr_mod_pow2_k import (
     LR_MOD_POW2_K_MAX,
     LR_MOD_POW2_K_MIN,
 )
+from ipu_common.lr_inc_dec_imm import (
+    LR_INC_DEC_IMM_FIELD_BITS,
+    lr_inc_dec_imm_max,
+)
 from ipu_common.mult_mask_offset import (
     MULT_MASK_OFFSET_FIELD_BITS,
     MULT_MASK_SLOT_COUNT,
+)
+from ipu_common.reshape_mask import (
+    RESHAPE_ELEMENT_COUNT,
+    RESHAPE_MASK_FIELD_BITS,
+    RESHAPE_MASK_LR_OFFSET,
+    reshape_mask_field_max,
 )
 from ipu_common.acc_stride_enums import (
     ELEMENTS_IN_ROW_NAMES,
     HORIZONTAL_STRIDE_NAMES,
     VERTICAL_STRIDE_NAMES,
 )
-from ipu_common.acc_agg_enums import AGG_MODE_NAMES, POST_FN_NAMES
 
 
 class LrModPow2KImmediate(ipu_token.IpuToken):
@@ -60,6 +69,15 @@ class BreakImmediateType(ipu_token.NumberToken):
         return 16
 
 
+class AddbiImmediate(ipu_token.NumberToken):
+    """Byte immediate for ADDBI: 0-255 (or an equivalent signed -128..127 literal,
+    encoded to the same bit pattern), reinterpreted as a signed int8 for the add.
+    """
+    @classmethod
+    def bits(cls) -> int:
+        return 8
+
+
 class MultMaskOffsetImmediate(ipu_token.IpuToken):
     """Select one of eight 128-bit mask slots in ``r_mask`` (values 0 .. 7)."""
 
@@ -96,6 +114,72 @@ class MultMaskOffsetImmediate(ipu_token.IpuToken):
         return str(value)
 
 
+class LrOrReshapeMaskImmediate(ipu_token.IpuToken):
+    """ACC.RESHAPE element-start index: immediate 0–7 or an LR register.
+
+    Encoding (width auto-derived, see RESHAPE_MASK_FIELD_BITS):
+      - Immediate  0–7 → encoded as the value itself (0–7).
+      - LRn            → encoded as LR_index + RESHAPE_MASK_LR_OFFSET; the
+        number of LR registers encodable is however much room remains above
+        RESHAPE_MASK_LR_OFFSET in the derived field width.
+
+    At runtime the emulator uses the encoded value to decide:
+      encoded < RESHAPE_MASK_LR_OFFSET → immediate mask.
+      encoded >= RESHAPE_MASK_LR_OFFSET → read LR[encoded - offset] as the
+        mask value (full register value — the emulator raises if it exceeds
+        RESHAPE_ELEMENT_COUNT rather than clamping it).
+    """
+
+    @classmethod
+    def bits(cls) -> int:
+        return RESHAPE_MASK_FIELD_BITS
+
+    @classmethod
+    def default(cls) -> "ipu_token.IpuToken":
+        return cls(ipu_token.AnnotatedToken(lark.Token("NUMBER", "0"), 0))
+
+    def __init__(self, token: ipu_token.AnnotatedToken):
+        super().__init__(token)
+        val = token.token.value.lower()
+        if val.startswith("lr"):
+            try:
+                lr_idx = int(val[2:])
+            except ValueError:
+                self._raise_error(
+                    f"Invalid LR register '{token.token.value}' for ACC.RESHAPE reshape_mask"
+                )
+            max_lr_index = reshape_mask_field_max() - RESHAPE_MASK_LR_OFFSET
+            if not (0 <= lr_idx <= max_lr_index):
+                self._raise_error(
+                    f"LR{lr_idx} out of range for ACC.RESHAPE reshape_mask; "
+                    f"only LR0–LR{max_lr_index} are supported"
+                )
+            self.int = lr_idx + RESHAPE_MASK_LR_OFFSET
+        else:
+            try:
+                imm = int(val, 0)
+            except ValueError:
+                self._raise_error(
+                    f"Value '{token.token.value}' is not a valid immediate or LR register "
+                    "for ACC.RESHAPE reshape_mask"
+                )
+            if not (0 <= imm < RESHAPE_MASK_LR_OFFSET):
+                self._raise_error(
+                    f"Immediate {imm} out of range [0, {RESHAPE_MASK_LR_OFFSET - 1}] "
+                    "for ACC.RESHAPE reshape_mask"
+                )
+            self.int = imm
+
+    def encode(self) -> int:
+        return self.int
+
+    @classmethod
+    def decode(cls, value: int) -> str:
+        if value >= RESHAPE_MASK_LR_OFFSET:
+            return f"lr{value - RESHAPE_MASK_LR_OFFSET}"
+        return str(value)
+
+
 from ipu_common.activations import ACTIVATION_FN_NAMES
 
 
@@ -107,52 +191,40 @@ class ActivationFnField(ipu_token.EnumToken):
         return list(ACTIVATION_FN_NAMES)
 
 
-# Encoding matches LcrIdx for register indices 0–31; values ≥32 encode IMM5 (payload in low 5 bits).
-_ADD_SUB_SRC_B_REGS: tuple[str, ...] = tuple(
-    [f"lr{i}" for i in range(16)] + [f"cr{i}" for i in range(16)]
-)
-_ADD_SUB_SRC_B_IMM_BASE = 32
+class LrIncDecImmediate(ipu_token.IpuToken):
+    """Unsigned immediate for ``INC`` / ``DEC`` in the LR slot.
 
-
-class AddSubSrcBField(ipu_token.IpuToken):
-    """Second source for ``add`` / ``sub``: lr0–lr15, cr0–cr15, or unsigned IMM5 (0–31).
-
-    Encoded in 6 bits: register indices use the same mapping as ``LcrIdx`` (0–31);
-    immediates use ``32 + imm``.
+    Bit width is derived from the LR slot union layout (see ``lr_inc_dec_imm``).
     """
 
     @classmethod
     def bits(cls) -> int:
-        return 6
+        return LR_INC_DEC_IMM_FIELD_BITS
 
     @classmethod
     def default(cls) -> "ipu_token.IpuToken":
-        return cls(ipu_token.AnnotatedToken(lark.Token("TOKEN", "lr0"), 0))
+        return cls(ipu_token.AnnotatedToken(lark.Token("NUMBER", "0"), 0))
 
     def __init__(self, token: ipu_token.AnnotatedToken):
         super().__init__(token)
-        raw = self.token.value.lower()
-        if raw in _ADD_SUB_SRC_B_REGS:
-            self._encoded = _ADD_SUB_SRC_B_REGS.index(raw)
-            return
         try:
-            imm = int(self.token.value, 0)
+            self.int = int(token.token.value, 0)
         except ValueError:
+            self._raise_error(f"Value {self.token.value} is not a valid integer")
+        imm_max = lr_inc_dec_imm_max()
+        if not (0 <= self.int <= imm_max):
             self._raise_error(
-                "Expected lr0–lr15, cr0–cr15, or an unsigned 5-bit immediate (0–31)"
+                f"Value {self.int} out of range [0, {imm_max}] "
+                "for INC/DEC immediate operand"
             )
-        if not (0 <= imm <= 31):
-            self._raise_error(f"Immediate operand must be in range [0, 31], got {imm}")
-        self._encoded = _ADD_SUB_SRC_B_IMM_BASE + imm
 
     def encode(self) -> int:
-        return self._encoded
+        return self.int
 
     @classmethod
     def decode(cls, value: int) -> str:
-        if value >= _ADD_SUB_SRC_B_IMM_BASE:
-            return str(value & 31)
-        return _ADD_SUB_SRC_B_REGS[value]
+        mask = (1 << LR_INC_DEC_IMM_FIELD_BITS) - 1
+        return str(value & mask)
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +233,14 @@ class AddSubSrcBField(ipu_token.IpuToken):
 # ---------------------------------------------------------------------------
 
 class ElementsInRowField(ipu_token.EnumToken):
-    """Elements per row: 8, 16, 32, or 64."""
+    """Elements per row: 16, 32, or 64."""
     @classmethod
     def enum_array(cls) -> list[str]:
         return list(ELEMENTS_IN_ROW_NAMES)
 
 
 class HorizontalStrideField(ipu_token.EnumToken):
-    """Horizontal stride: enabled(1), inverted(2), expand(3). Bits 0..2."""
+    """Horizontal stride: off, on, or on_inv."""
     @classmethod
     def enum_array(cls) -> list[str]:
         return list(HORIZONTAL_STRIDE_NAMES)
@@ -181,20 +253,3 @@ class VerticalStrideField(ipu_token.EnumToken):
         return list(VERTICAL_STRIDE_NAMES)
 
 
-# ---------------------------------------------------------------------------
-# acc.agg operand enums (instruction-specific)
-# Single source of truth: ipu_common.acc_agg_enums
-# ---------------------------------------------------------------------------
-
-class AggModeField(ipu_token.EnumToken):
-    """Aggregation mode: sum or max."""
-    @classmethod
-    def enum_array(cls) -> list[str]:
-        return list(AGG_MODE_NAMES)
-
-
-class PostFnField(ipu_token.EnumToken):
-    """Post function: value, value_cr, inv, inv_sqrt."""
-    @classmethod
-    def enum_array(cls) -> list[str]:
-        return list(POST_FN_NAMES)

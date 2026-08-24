@@ -45,6 +45,7 @@ ipu-c-samples/
 
 The IPU supports a custom assembly language with powerful preprocessing capabilities. See the [Assembly Syntax Guide](assembly-syntax.md) for:
 
+- [Instruction format](instruction-format.md) — generated bit layout, C header and SystemVerilog package downloads
 - Basic instruction format and syntax
 - Instruction separators (`;` vs `;;`)
 - Register types and immediate values  
@@ -75,6 +76,7 @@ bazel build //docs:build_docs
 ## Next Steps
 
 - [Building Applications](building-applications.md) - Learn how to build IPU applications
+- [IPU Configuration](ipu-configuration.md) - Configure dtype, CR constants, and dstructure element counts
 - [Assembly Syntax Guide](assembly-syntax.md) — syntax, compounds, Jinja2 (generated)
 - [Operand types](operand-types.md) — type names used in the instruction reference tables
 - [Instruction Reference](instructions.md) — all opcodes (generated)

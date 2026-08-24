@@ -31,6 +31,12 @@ from typing import Any
 import numpy as np
 
 from ipu_emu.descriptors import REGFILE_SCHEMA, RegDescriptor, RegDtype, RegKind
+from ipu_emu.ipu_config import (
+    CR_READ_ONLY_INITIAL_VALUES,
+    CR_REGISTER_NAME,
+    LR_CR_SCALAR_VALUE_MASK,
+    REGISTER_WORD_VALUE_MASK,
+)
 
 
 class RegFile:
@@ -61,6 +67,17 @@ class RegFile:
         # (eliminates duplication between REGISTER_DEFINITIONS and hard-coded methods)
         _attach_dynamic_accessors(self)
 
+        for index, value in CR_READ_ONLY_INITIAL_VALUES.items():
+            self.set_scalar(
+                CR_REGISTER_NAME,
+                index,
+                value,
+                allow_read_only=True,
+            )
+
+        # R_MASK defaults to all-ones: bit=1 means lane active, bit=0 means deactivated.
+        self._storage["r_mask"][:] = b"\xff" * len(self._storage["r_mask"])
+
     # -- helpers ------------------------------------------------------------
 
     def _resolve(self, name: str) -> str:
@@ -88,14 +105,33 @@ class RegFile:
         buf = self._storage[self._resolve(name)]
         return struct.unpack_from("<I", buf, offset)[0]
 
-    def set_scalar(self, name: str, index: int, value: int) -> None:
-        """Write a 32-bit scalar register (LR / CR) at *index*."""
+    def set_scalar(
+        self,
+        name: str,
+        index: int,
+        value: int,
+        *,
+        allow_read_only: bool = False,
+    ) -> None:
+        """Write a scalar register (LR / CR) at *index*."""
         desc = self._desc(name)
         assert not desc.is_vector, f"{name} is not a scalar register"
         assert 0 <= index < desc.count, f"{name}[{index}] out of range (count={desc.count})"
+
+        if self._is_read_only_cr(desc, index) and not allow_read_only:
+            return
+
+        if desc.kind in (RegKind.CR, RegKind.LR):
+            value &= LR_CR_SCALAR_VALUE_MASK
+        else:
+            value &= REGISTER_WORD_VALUE_MASK
+
         offset = index * desc.size_bytes
         buf = self._storage[self._resolve(name)]
-        struct.pack_into("<I", buf, offset, value & 0xFFFFFFFF)
+        struct.pack_into("<I", buf, offset, value)
+
+    def _is_read_only_cr(self, desc: RegDescriptor, index: int) -> bool:
+        return desc.kind == RegKind.CR and index in CR_READ_ONLY_INITIAL_VALUES
 
     # -- All convenience accessors generated from schema --------------------
     # get_lr, set_lr, get_cr, set_cr, get_r, set_r, get_r_cyclic_at,
@@ -314,34 +350,51 @@ def _add_indexed_vector_accessors(
 # ---------------------------------------------------------------------------
 
 def _add_cyclic_accessors(methods: dict, name: str, total_size: int) -> None:
-    def _make_get(n: str = name, sz: int = total_size):
-        def get_at(self, start_idx: int, length: int = 128) -> bytearray:
+    """Generate wrapping get/set accessors for a cyclic register.
+
+    ``RegFile`` has no concept of "mode" -- ``r_cyclic`` is allocated a fixed
+    2048 B always, but must wrap at 512 B in narrow mode and 2048 B in
+    wide-vector debug mode (both are 512 *elements*, just a different byte
+    count per element). Rather than have ``RegFile`` know about modes, the
+    wrap size is an explicit ``wrap_size`` argument the mode-aware caller
+    (``Ipu``) supplies on every call; it defaults to the full allocation
+    (``total_size``) for callers that don't need mode-dependent wrapping
+    (tests, debug tooling).
+    """
+    def _make_get(n: str = name, default_sz: int = total_size):
+        def get_at(self, start_idx: int, length: int = 128, wrap_size: int | None = None) -> bytearray:
             buf = self._storage[n]
+            sz = default_sz if wrap_size is None else wrap_size
             start_idx %= sz
             if start_idx + length <= sz:
                 return bytearray(buf[start_idx : start_idx + length])
-            first = buf[start_idx:]
+            first = buf[start_idx:sz]
             second = buf[: length - len(first)]
             return bytearray(first + second)
         get_at.__name__ = f"get_{n}_at"
         get_at.__doc__ = (
-            f"Read *length* bytes from {n} starting at *start_idx* (wrapping)."
+            f"Read *length* bytes from {n} starting at *start_idx*, wrapping at "
+            f"*wrap_size* bytes (default: the full {n} allocation)."
         )
         return get_at
 
-    def _make_set(n: str = name, sz: int = total_size):
-        def set_at(self, start_idx: int, data: bytes | bytearray) -> None:
+    def _make_set(n: str = name, default_sz: int = total_size):
+        def set_at(self, start_idx: int, data: bytes | bytearray, wrap_size: int | None = None) -> None:
             buf = self._storage[n]
+            sz = default_sz if wrap_size is None else wrap_size
             start_idx %= sz
             length = len(data)
             if start_idx + length <= sz:
                 buf[start_idx : start_idx + length] = data
             else:
                 first_len = sz - start_idx
-                buf[start_idx:] = data[:first_len]
+                buf[start_idx : start_idx + first_len] = data[:first_len]
                 buf[: length - first_len] = data[first_len:]
         set_at.__name__ = f"set_{n}_at"
-        set_at.__doc__ = f"Write *data* into {n} at *start_idx* (wrapping)."
+        set_at.__doc__ = (
+            f"Write *data* into {n} at *start_idx*, wrapping at *wrap_size* "
+            f"bytes (default: the full {n} allocation)."
+        )
         return set_at
 
     methods[f"get_{name}_at"] = _make_get()
@@ -373,7 +426,12 @@ def _add_word_view_accessors(methods: dict, name: str, size: int) -> None:
     def _make_set_word(n: str = name, nw: int = n_words):
         def set_word(self, index: int, value: int) -> None:
             assert 0 <= index < nw, f"{n} word[{index}] out of range ({nw} words)"
-            struct.pack_into("<I", self._storage[n], index * 4, value & 0xFFFFFFFF)
+            struct.pack_into(
+                "<I",
+                self._storage[n],
+                index * 4,
+                value & REGISTER_WORD_VALUE_MASK,
+            )
         set_word.__name__ = f"set_{n}_word"
         set_word.__doc__ = f"Set one uint32 word in {n}."
         return set_word

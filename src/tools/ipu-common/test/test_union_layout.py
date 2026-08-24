@@ -1,7 +1,12 @@
 """Tests for the union layout solver."""
 from __future__ import annotations
 
-from ipu_common.instruction_spec import INSTRUCTION_SPEC, SLOT_UNIONS
+from ipu_common.instruction_spec import (
+    INSTRUCTION_SPEC,
+    SLOT_METADATA,
+    SLOT_UNIONS,
+    is_hardware_slot,
+)
 from ipu_common.union_layout import compute_slot_layouts, get_operand_type_bits
 
 
@@ -71,7 +76,34 @@ def test_lr_slot_sharing():
     )
 
 
+def test_lr_slot_opcode_bits():
+    """Nine LR opcodes (incl. ADDB/ADDBI) require a 4-bit opcode field."""
+    assert SLOT_UNIONS["lr"].opcode_bits == 4
+
+
+def test_lr_slot_total_width_unchanged():
+    """LR sub-instruction stays 20 bits after ADDB/ADDBI and opcode growth."""
+    su = SLOT_UNIONS["lr"]
+    total = su.opcode_bits + sum(f.bits for f in su.fields)
+    assert total == 20, f"Expected 20-bit LR slot, got {total}"
+
+
+def test_lr_inc_dec_imm_width_derived():
+    """INC/DEC immediate shares its field with ADDBI's 8-bit AddbiImmediate (8 bits)."""
+    from ipu_common.lr_inc_dec_imm import LR_INC_DEC_IMM_FIELD_BITS
+
+    assert LR_INC_DEC_IMM_FIELD_BITS == 8
+
+
 def test_all_slots_present():
     """All expected slots are computed."""
-    expected = {"xmem", "lr", "mult", "acc", "aaq", "cond", "break"}
+    expected = {"load", "store", "acc_store", "lr", "mult", "acc", "aaq", "cond", "break"}
     assert set(SLOT_UNIONS.keys()) == expected
+
+
+def test_acc_store_slot_marked_non_hardware():
+    """The acc_store slot is flagged simulation-only in SLOT_METADATA."""
+    assert SLOT_METADATA["acc_store"]["hardware"] is False
+    assert is_hardware_slot("load")
+    assert is_hardware_slot("store")
+    assert not is_hardware_slot("acc_store")

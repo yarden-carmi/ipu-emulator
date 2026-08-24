@@ -8,6 +8,15 @@ import pytest
 
 from ipu_emu.descriptors import REGFILE_SCHEMA, RegDescriptor, RegDtype, RegKind
 from ipu_emu.regfile import RegFile
+from ipu_emu.ipu_config import (
+    CR_DSTRUCTURE_REG_INDEX,
+    DSTRUCTURE_PARTITION_MASK,
+    DSTRUCTURE_VALID_ELEMENTS_MASK,
+    PadMode,
+    Partition,
+    decode_dstructure,
+    encode_dstructure,
+)
 from ipu_emu.ipu_state import IpuState
 
 
@@ -25,15 +34,28 @@ class TestRegFileScalars:
 
     def test_cr_set_get(self):
         rf = RegFile()
-        rf.set_cr(0, 42)
-        rf.set_cr(15, 0xDEADBEEF)
-        assert rf.get_cr(0) == 42
-        assert rf.get_cr(15) == 0xDEADBEEF
+        rf.set_cr(2, 0xCAFE)  # CR0/CR1 are locked
+        assert rf.get_cr(2) == 0xCAFE
+
+    def test_cr0_is_permanently_zero(self):
+        rf = RegFile()
+        rf.set_cr(0, 0xFFFFFF)  # write is silently ignored
+        assert rf.get_cr(0) == 0
+
+    def test_cr1_is_permanently_one(self):
+        rf = RegFile()
+        rf.set_cr(1, 0xFFFFFF)  # write is silently ignored
+        assert rf.get_cr(1) == 1
+
+    def test_cr_32bit_mask(self):
+        rf = RegFile()
+        rf.set_cr(3, (1 << 33) | 0xDEADBEEF)  # 34 bits — should be masked to 32 bits
+        assert rf.get_cr(3) == 0xDEADBEEF
 
     def test_lr_overflow_wraps_to_32bit(self):
         rf = RegFile()
-        rf.set_lr(0, 0x1_0000_0001)  # > 32 bits
-        assert rf.get_lr(0) == 1  # only low 32 bits kept
+        rf.set_lr(0, (1 << 33) | 0xDEADBEEF)  # > 32 bits
+        assert rf.get_lr(0) == 0xDEADBEEF  # only low 32 bits kept
 
     def test_lr_index_out_of_range(self):
         rf = RegFile()
@@ -100,14 +122,18 @@ class TestRegFileCyclic:
         assert got == data
 
     def test_modulo_index(self):
-        """Index 512 should be equivalent to index 0."""
+        """Index 512 should be equivalent to index 0 -- r_cyclic is allocated
+        exactly 512 B (narrow-only; wide-vector debug mode uses the separate
+        r_cyclic_wide_debug register, #180), so the default wrap (the full
+        allocation) already lands on the 512-byte boundary with no explicit
+        wrap_size needed."""
         rf = RegFile()
         data = bytearray([0xCC] * 128)
         rf.set_r_cyclic_at(512, data)
         assert rf.get_r_cyclic_at(0, 128) == data
 
     def test_read_wraps_correctly(self):
-        """Fill entire cyclic buffer, read 128 from near the end."""
+        """Fill the 512-byte cyclic buffer, read 128 from near the wrap boundary."""
         rf = RegFile()
         full = bytearray(range(256)) * 2  # 512 bytes
         rf.set_r_cyclic_at(0, full)
@@ -116,6 +142,14 @@ class TestRegFileCyclic:
         got = rf.get_r_cyclic_at(450)
         expected = full[450:] + full[: 128 - (512 - 450)]
         assert got == expected
+
+    def test_default_wrap_is_full_allocation(self):
+        """With no wrap_size argument, RegFile wraps at the full 512 B allocation --
+        it has no concept of 'mode'; r_cyclic itself is narrow-only storage."""
+        rf = RegFile()
+        data = bytearray([0xAB] * 128)
+        rf.set_r_cyclic_at(512, data)  # no wrap_size -> defaults to 512 (full allocation)
+        assert rf.get_r_cyclic_at(0, 128) == data
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +298,70 @@ class TestIpuState:
         state.program_counter = 1024
         assert state.is_halted
 
-    def test_cr_dtype(self):
+    def test_dtype_attribute(self):
+        from ipu_emu.ipu_math import DType
         state = IpuState()
-        state.set_cr_dtype(2)
-        assert state.get_cr_dtype() == 2
+        assert state.dtype == DType.INT8  # default
+        state.dtype = DType.E4
+        assert state.dtype == DType.E4
+
+    def test_cr15_default_dstructure(self):
+        state = IpuState()
+        valid_elements, partition = state.get_cr_dstructure()
+        assert valid_elements == 128
+        assert partition == 0
+
+    def test_set_cr_dstructure(self):
+        state = IpuState()
+        state.set_cr_dstructure(64, 2)
+        config = state.get_cr_dstructure()
+        assert config.valid_elements == 64
+        assert config.partition == 2
+
+    def test_cr_dstructure_masks_valid_elements(self):
+        state = IpuState()
+        state.set_cr_dstructure(valid_elements=DSTRUCTURE_VALID_ELEMENTS_MASK + 1)
+        assert state.get_cr_dstructure().valid_elements == 0
+
+    def test_cr_dstructure_invalid_partition_raises(self):
+        with pytest.raises(ValueError, match="not a valid Partition"):
+            encode_dstructure(valid_elements=64, partition=3)
+
+    def test_dstructure_codec_round_trip(self):
+        raw = encode_dstructure(valid_elements=17, partition=4)
+        decoded = decode_dstructure(raw)
+        assert decoded.valid_elements == 17
+        assert decoded.partition == 4
+
+    def test_dstructure_pad_mode_defaults_to_zero(self):
+        assert IpuState().get_cr_dstructure().pad_mode == PadMode.ZERO
+
+    def test_dstructure_pad_mode_codec_round_trip(self):
+        raw = encode_dstructure(valid_elements=17, partition=4, pad_mode=PadMode.NEG_INF)
+        decoded = decode_dstructure(raw)
+        assert decoded.valid_elements == 17
+        assert decoded.partition == 4
+        assert decoded.pad_mode == PadMode.NEG_INF
+
+    def test_dstructure_invalid_pad_mode_raises(self):
+        with pytest.raises(ValueError, match="not a valid PadMode"):
+            encode_dstructure(valid_elements=64, partition=0, pad_mode=3)
+
+    def test_set_cr_dstructure_accepts_pad_mode(self):
+        state = IpuState()
+        state.set_cr_dstructure(valid_elements=64, partition=2, pad_mode=PadMode.POS_INF)
+        config = state.get_cr_dstructure()
+        assert config.valid_elements == 64
+        assert config.partition == 2
+        assert config.pad_mode == PadMode.POS_INF
+
+    def test_cr_dstructure_uses_config_register(self):
+        state = IpuState()
+        state.set_cr_dstructure(7, 4)
+        assert state.regfile.get_cr(CR_DSTRUCTURE_REG_INDEX) == encode_dstructure(
+            valid_elements=7,
+            partition=4,
+        )
 
     def test_load_store_r_reg_xmem(self):
         """Load data into XMEM, then load into R register, verify."""

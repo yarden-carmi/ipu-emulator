@@ -26,10 +26,13 @@ OPERAND TYPE NAMES (resolved by ipu_as into actual token classes):
   - "LrIdx": LR0–LR15 (LrRegField)  
   - "CrIdx": CR0–CR15 (CrRegField)
   - "LcrIdx": LR0–LR15 or CR0–CR15 (LcrRegField)
-  - "AddSubSrcB": second operand for ADD/SUB — LR, CR, or unsigned IMM5 (AddSubSrcBField; 6-bit encoding)
+  - "LrdIdx": LRD0, LRD2, LRD4, ..., LRD14 register-pair alias over LR (LrdRegField), named after the lower register in the pair; no physical storage — LRDn = LR(n+1):LR(n)
+  - "LrIncDecImmediate": unsigned immediate for INC/DEC; bit width derived from LR slot union layout
+  - "AddbiImmediate": byte immediate for ADDBI (0–255, or an equivalent signed literal); reinterpreted as signed int8 for the add
   - "LrModPow2KImmediate": k operand for INCR_MOD_POW2 (semantic k ∈ [1, 9]; encoded as k−1 in 4 bits)
   - "MultMaskOffsetImmediate": mask slot index for mult masking (0–7; eight 128-bit slots in R_MASK)
-  - "ActivationFn": keyword on `ACTIVATE` (see ``ACTIVATION_FN_NAMES`` in ``activations.py``)
+  - "LrOrReshapeMaskImmediate": element-start index for RESHAPE; selects trailing elements (reshape_mask..7); accepts immediate 0–7 or an LR register (bit width, and therefore the range of encodable LR registers, derived from union layout)
+  - "ActivationFn": keyword on `ACTIVATE.QUANTIZE` (see ``ACTIVATION_FN_NAMES`` in ``activations.py``)
   - "BreakImmediate": 16-bit BREAK condition value (BreakImmediateType)
   - "Label": Branch target label (LabelToken)
 
@@ -84,6 +87,8 @@ __all__ = [
     "SLOT_BINARY_LAYOUT",
     "SLOT_UNIONS",
     "SLOT_COUNT",
+    "SLOT_METADATA",
+    "COMPOUND_LAYOUT_SLOT_ORDER",
     "VALID_OPERAND_TYPES",
     "SlotUnion",
     "canonical_instruction_name",
@@ -92,7 +97,11 @@ __all__ = [
     "create_assembler_opcodes",
     "create_emulator_constants",
     "get_operand_names_and_types",
+    "is_hardware_slot",
     "validate_instruction_spec",
+    "PSEUDO_INSTRUCTION_SPEC",
+    "find_pseudo_instruction",
+    "validate_pseudo_instruction_spec",
 ]
 
 
@@ -109,6 +118,7 @@ class InstructionDoc:
     operands: list[str]
     operation: str | None = None
     example: str | None = None
+    notes: str | None = None
 
 
 # ===========================================================================
@@ -134,7 +144,9 @@ SLOT_UNIONS: dict = {}
 # Most slots appear once; LR appears three times (three independent sub-instructions).
 SLOT_COUNT: dict[str, int] = {
     "break": 1,
-    "xmem": 1,
+    "load": 1,
+    "store": 1,
+    "acc_store": 1,
     "mult": 1,
     "acc": 1,
     "aaq": 1,
@@ -142,38 +154,53 @@ SLOT_COUNT: dict[str, int] = {
     "cond": 1,
 }
 
+# Compound instruction binary layout (MSB → LSB).  Used by the assembler,
+# union-layout SVG, and docs — keep in sync with compound_inst encoding order.
+COMPOUND_LAYOUT_SLOT_ORDER: list[str] = [
+    "cond",
+    "lr",
+    "load",
+    "mult",
+    "acc",
+    "aaq",
+    "store",
+    "acc_store",
+    "break",
+]
+
+# Per-slot metadata.  ``hardware: False`` marks simulation-only slots that are
+# not implemented in real IPU hardware (excluded from HW codegen).
+SLOT_METADATA: dict[str, dict] = {
+    "load":      {"description": "First-stage memory loads that feed the multiply unit (mult-stage, cyclic, and mask registers)."},
+    "store":     {"description": "Last-stage memory stores that drain POST_AAQ_REG to external memory after activation and quantization."},
+    "acc_store": {"hardware": False, "description": "Simulation-only stores of R_ACC to external memory (STR_ACC_REG). Not implemented in real IPU hardware."},
+    "mult":      {"description": "Multiply-stage instructions: element-wise and vector multiply operations."},
+    "acc":       {"description": "Accumulation instructions for combining multiply results into R_ACC."},
+    "aaq":       {"description": "Activation and quantization: apply activation to R_ACC and write quantized INT8 bytes to POST_AAQ_REG."},
+    "lr":        {"description": "Loop register instructions for controlling addresses, counters, and scalars. Three independent sub-slots per cycle."},
+    "cond":      {"description": "Conditional and unconditional branches; control flow based on register comparisons."},
+    "break":     {"description": "Debug break: halts execution or enters debug mode."},
+}
+
+
+def is_hardware_slot(slot_type: str) -> bool:
+    """Return True when *slot_type* is implemented in real IPU hardware."""
+    return SLOT_METADATA.get(slot_type, {}).get("hardware", True)
+
 
 # ===========================================================================
 # MASTER INSTRUCTION SPECIFICATION
 # ===========================================================================
-# Each slot type (xmem, lr, mult, acc, cond, break) is defined separately.
-# Instructions maintain ORDER — position in dict determines opcode!
+# Each slot type (load, store, acc_store, lr, mult, acc, cond, break) is defined
+# separately.  Instructions maintain ORDER — position in dict determines opcode!
 # ===========================================================================
 
 INSTRUCTION_SPEC = {
     # =========================================================================
-    # XMEM Slot (Memory Load/Store Instructions)
-    # Opcode = position in list: STR_ACC_REG=0, LDR_MULT_REG=1, etc.
+    # LOAD Slot (first pipeline stage — feeds the multiply unit)
+    # Opcode = position in list: LDR_MULT_REG=0, LDR_CYCLIC_MULT_REG=1, etc.
     # =========================================================================
-    "xmem": {
-        "STR_ACC_REG": {
-            "operands": [
-                {"name": "offset", "type": "LrIdx", "read": "live"},
-                {"name": "base", "type": "CrIdx", "read": "live"},
-            ],
-            "doc": InstructionDoc(
-                title="Store Accumulator",
-                summary="Store accumulator to memory.",
-                syntax="STR_ACC_REG offset, base",
-                operands=[
-                    "offset: Offset register (LR0–LR15)",
-                    "base: Base address register (CR0–CR15)",
-                ],
-                operation="Memory[offset + base] = R_ACC",
-                example="STR_ACC_REG CR0, CR1;;",
-            ),
-            "execute_fn": "execute_str_acc_reg",
-        },
+    "load": {
         "LDR_MULT_REG": {
             "operands": [
                 {"name": "dest", "type": "MultStageReg"},
@@ -186,10 +213,10 @@ INSTRUCTION_SPEC = {
                 syntax="LDR_MULT_REG dest, offset, base",
                 operands=[
                     "`dest`: **`R0`** | **`R1`** — mult-stage register to load (2-bit field; only these encodings are valid).",
-                    "`offset`: **`LR0`**…**`LR15`** — offset register.",
-                    "`base`: **`CR0`**…**`CR15`** — base address register.",
+                    "`offset`: **`LR0`**…**`LR15`** — offset register, in XMEM rows.",
+                    "`base`: **`CR0`**…**`CR15`** — base address register, in XMEM rows.",
                 ],
-                operation="dest = Memory[offset + base]  # 128 elements (512 in wide-vector debug mode)",
+                operation="dest = Memory[row(offset + base)]  # one row = 128 elements (128 B narrow, 512 B wide-vector debug)",
                 example="SET LR0, CR1;;\nLDR_MULT_REG R0, LR0, CR0;;",
             ),
             "execute_fn": "execute_ldr_mult_reg",
@@ -205,11 +232,11 @@ INSTRUCTION_SPEC = {
                 summary="Load with cyclic addressing into R_CYCLIC.",
                 syntax="LDR_CYCLIC_MULT_REG offset, base, index",
                 operands=[
-                    "offset: Offset register (LR0–LR15)",
-                    "base: Base address register (CR0–CR15)",
-                    "index: Index inside cyclic register (LR0–LR15)",
+                    "offset: Offset register (LR0–LR15), in XMEM rows.",
+                    "base: Base address register (CR0–CR14), in XMEM rows.",
+                    "index: Index inside cyclic register (LR0–LR15); must hold 0, 128, 256, or 384 — the four R_CYCLIC slot boundaries. Any other value raises an error. In wide-vector debug mode index must be 0 (the load fills the whole register).",
                 ],
-                operation="R_CYCLIC[index % 512:128] = Memory[offset + base]",
+                operation="R_CYCLIC[index .. index+127] = Memory[row(offset + base)]   # index ∈ {0, 128, 256, 384}",
             ),
             "execute_fn": "execute_ldr_cyclic_mult_reg",
         },
@@ -223,23 +250,29 @@ INSTRUCTION_SPEC = {
                 summary="Load mask data from memory.",
                 syntax="LDR_MULT_MASK_REG offset, base, mask_idx",
                 operands=[
-                    "offset: Offset register (LR0–LR15)",
-                    "base: Base address register (CR0–CR15)",
+                    "offset: Offset register (LR0–LR15), in XMEM rows.",
+                    "base: Base address register (CR0–CR14), in XMEM rows.",
                 ],
-                operation="R_MASK = Memory[offset + base]",
+                operation="R_MASK = Memory[row(offset + base) .. +128B]  # reads only the row's first 128 B, in both modes -- the mask is 1 bit/element and does not scale with element width",
             ),
             "execute_fn": "execute_ldr_mult_mask_reg",
         },
-        "XMEM_NOP": {
+        "NOP": {
             "operands": [],
             "doc": InstructionDoc(
-                title="No Operation (XMEM)",
-                summary="No operation for xmem slot.",
-                syntax="XMEM_NOP",
+                title="No Operation",
+                summary="No operation for load slot.",
+                syntax="NOP",
                 operands=[],
             ),
-            "execute_fn": "execute_xmem_nop",
+            "execute_fn": "execute_load_nop",
         },
+    },
+
+    # =========================================================================
+    # STORE Slot (last pipeline stage — drains POST_AAQ_REG after AAQ/activate)
+    # =========================================================================
+    "store": {
         "STR_POST_AAQ_REG": {
             "operands": [
                 {"name": "offset", "type": "LrIdx", "read": "live"},
@@ -249,23 +282,72 @@ INSTRUCTION_SPEC = {
                 title="Store Post-AAQ register",
                 summary=(
                     "Write **512 bytes** of **`POST_AAQ_REG`** to external memory. **Interim:** "
-                    "the buffer is **512 bytes** (128×32-bit lanes) until quantization export is finalized."
+                    "the buffer is **512 bytes** (128×32-bit elements) until quantization export is finalized."
                 ),
                 syntax="STR_POST_AAQ_REG offset, base",
                 operands=[
-                    "offset: Offset register (LR0–LR15)",
-                    "base: Base address register (CR0–CR15)",
+                    "offset: Offset register (LR0–LR15), in XMEM rows.",
+                    "base: Base address register (CR0–CR14), in XMEM rows.",
                 ],
-                operation="Memory[offset + base] = POST_AAQ_REG (512 bytes); interim staging register",
+                operation="Memory[row(offset + base)] = POST_AAQ_REG (512 bytes, both modes -- width does not scale with element width); interim staging register",
                 example="STR_POST_AAQ_REG LR0, CR0;;",
             ),
             "execute_fn": "execute_str_post_aaq_reg",
+        },
+        "NOP": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="No Operation",
+                summary="No operation for store slot.",
+                syntax="NOP",
+                operands=[],
+            ),
+            "execute_fn": "execute_store_nop",
+        },
+    },
+
+    # =========================================================================
+    # ACC_STORE Slot (simulation-only — NOT implemented in real IPU hardware)
+    # =========================================================================
+    "acc_store": {
+        "STR_ACC_REG": {
+            "operands": [
+                {"name": "offset", "type": "LrIdx", "read": "live"},
+                {"name": "base", "type": "CrIdx", "read": "live"},
+            ],
+            "doc": InstructionDoc(
+                title="Store Accumulator",
+                summary=(
+                    "Store **R_ACC** to external memory. **Simulation-only** — not "
+                    "implemented in real IPU hardware."
+                ),
+                syntax="STR_ACC_REG offset, base",
+                operands=[
+                    "offset: Offset register (LR0–LR15), in XMEM rows.",
+                    "base: Base address register (CR0–CR14), in XMEM rows.",
+                ],
+                operation="Memory[row(offset + base)] = R_ACC (512 bytes, both modes -- width does not scale with element width)",
+                example="STR_ACC_REG CR0, CR1;;",
+                notes="This instruction lives in the simulation-only **acc_store** slot.",
+            ),
+            "execute_fn": "execute_str_acc_reg",
+        },
+        "NOP": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="No Operation",
+                summary="No operation for acc_store slot (simulation-only).",
+                syntax="NOP",
+                operands=[],
+            ),
+            "execute_fn": "execute_acc_store_nop",
         },
     },
     
     # =========================================================================
     # LR Slot (Loop Register Instructions)
-    # Opcode = position: SET=0, ADD=1, SUB=2, INCR_MOD_POW2=3
+    # Opcode = position: SET=0, ADD=1, SUB=2, INCR_MOD_POW2=3, INC=4, DEC=5,
+    #          ADDB=6, ADDBI=7, NOP=8
     # =========================================================================
     "lr": {
         "SET": {
@@ -290,22 +372,21 @@ INSTRUCTION_SPEC = {
             "operands": [
                 {"name": "dest", "type": "LrIdx"},
                 {"name": "src_a", "type": "LrIdx", "read": "snapshot"},
-                {"name": "src_b", "type": "AddSubSrcB", "read": "snapshot"},
+                {"name": "src_b", "type": "LcrIdx", "read": "snapshot"},
             ],
             "doc": InstructionDoc(
                 title="Add",
                 summary=(
-                    "Add two sources (second source may be an LR, CR, or 5-bit unsigned immediate) "
-                    "and store the result in the destination LR."
+                    "Add two register sources and store the result in the destination LR."
                 ),
                 syntax="ADD dest, src_a, src_b",
                 operands=[
                     "dest: Destination local register (LR0–LR15)",
                     "src_a: First source local register (LR0–LR15)",
-                    "src_b: Second source — LR0–LR15, CR0–CR15, or unsigned immediate 0–31",
+                    "src_b: Second source — LR0–LR15 or CR0–CR15",
                 ],
                 operation="dest = src_a + src_b",
-                example="ADD LR0, LR1, LR2;;\nADD LR3, LR1, CR5;;\nADD LR4, LR1, 7;;",
+                example="ADD LR0, LR1, LR2;;\nADD LR3, LR1, CR5;;",
             ),
             "execute_fn": "execute_lr_add",
         },
@@ -313,22 +394,22 @@ INSTRUCTION_SPEC = {
             "operands": [
                 {"name": "dest", "type": "LrIdx"},
                 {"name": "src_a", "type": "LrIdx", "read": "snapshot"},
-                {"name": "src_b", "type": "AddSubSrcB", "read": "snapshot"},
+                {"name": "src_b", "type": "LcrIdx", "read": "snapshot"},
             ],
             "doc": InstructionDoc(
                 title="Subtract",
                 summary=(
-                    "Subtract the second source from the first (second source may be an LR, CR, "
-                    "or 5-bit unsigned immediate) and store the result in the destination LR."
+                    "Subtract the second source from the first and store the result "
+                    "in the destination LR."
                 ),
                 syntax="SUB dest, src_a, src_b",
                 operands=[
                     "dest: Destination local register (LR0–LR15)",
                     "src_a: First source local register (LR0–LR15)",
-                    "src_b: Second source — LR0–LR15, CR0–CR15, or unsigned immediate 0–31",
+                    "src_b: Second source — LR0–LR15 or CR0–CR15",
                 ],
                 operation="dest = src_a - src_b",
-                example="SUB LR0, LR1, LR2;;\nSUB LR3, LR1, CR5;;\nSUB LR4, LR1, 7;;",
+                example="SUB LR0, LR1, LR2;;\nSUB LR3, LR1, CR5;;",
             ),
             "execute_fn": "execute_lr_sub",
         },
@@ -355,289 +436,371 @@ INSTRUCTION_SPEC = {
             ),
             "execute_fn": "execute_lr_incr_mod_pow2",
         },
-    },
-    
-    # =========================================================================
-    # MULT Slot (Multiply Instructions)
-    # Opcode = position: MULT.EE=0, MULT.VE.CYCLIC=1, MULT.VE.PADDED=2, MULT_NOP=3,
-    #          MULT.VE.CR=4, MULT.VE.AAQ=5, MULT.EE.RR=6
-    # =========================================================================
-    "mult": {
-        "MULT.EE": {
+        "INC": {
             "operands": [
-                {"name": "ra", "type": "MultStageReg", "read": "live"},
-                {"name": "cyclic_offset", "type": "LrIdx", "read": "live"},
-                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
-                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "dest", "type": "LrIdx"},
+                {"name": "imm", "type": "LrIncDecImmediate"},
             ],
             "doc": InstructionDoc(
-                title="Element-wise Multiply",
-                summary="Multiply elements of two registers element by element.",
-                syntax="MULT.EE ra, cyclic_offset, mask_offset, mask_shift",
-                operands=[
-                    "`ra`: **`R0`** | **`R1`** — multiplicand mult-stage register (same cycle as `LDR_MULT_REG` into **`R0`**/**`R1`** is allowed).",
-                    "`cyclic_offset`: **`LR0`**…**`LR15`** — base byte offset into **`R_CYCLIC`**.",
-                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
-                    "`mask_shift`: **`LR0`**…**`LR15`** — shift applied to the mask register.",
-                ],
-                operation="For each lane i: MULT_RES[i] = ipu_mult(ra[i], R_CYCLIC[cyclic_offset + i]); then apply mask and shift.",
-                example="MULT.EE R0, LR0, 0, LR2;;",
-            ),
-            "execute_fn": "execute_mult_ee",
-        },
-        "MULT.VE.CYCLIC": {
-            "operands": [
-                {"name": "cyclic_offset", "type": "LrIdx", "read": "live"},
-                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
-                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
-                {"name": "fixed_idx", "type": "LrIdx", "read": "live"},
-            ],
-            "doc": InstructionDoc(
-                title="Vector-Element Multiply (cyclic RC)",
+                title="Increment",
                 summary=(
-                    "Multiply a fixed element from R0 or R1 against R_CYCLIC[cyclic_offset:cyclic_offset+128]. "
-                    "`fixed_idx` 0..127 selects `R0[fixed_idx]`, 128..255 selects `R1[fixed_idx - 128]`. "
-                    "R_CYCLIC is addressed cyclically modulo 512 elements (no padding with 1 past the boundary)."
+                    "Add an unsigned immediate to the destination LR (read-modify-write)."
                 ),
-                syntax="MULT.VE.CYCLIC cyclic_offset, mask_offset, mask_shift, fixed_idx",
+                syntax="INC dest, imm",
                 operands=[
-                    "`cyclic_offset`: **`LR0`**…**`LR15`** — base byte offset into **`R_CYCLIC`** (reduced mod 512).",
-                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
-                    "`mask_shift`: **`LR0`**…**`LR15`** — shift applied to the mask register.",
-                    "`fixed_idx`: **`LR0`**…**`LR15`** (value read live) — scalar index into **`R0`**/**`R1`**.",
+                    "dest: Destination local register (LR0–LR15); also the implicit source",
+                    "imm: Unsigned immediate; range 0 to 2^W − 1 where W is derived from the LR slot union layout",
                 ],
-                operation="For i in [0, 128): rb = R_CYCLIC[(cyclic_offset + i) % 512]; scalar from R0/R1 via fixed_idx; MULT_RES[i] = scalar * rb (then mask/shift).",
-                example="MULT.VE.CYCLIC LR0, 0, LR2, LR3;;",
+                operation="dest = dest + imm",
+                example="INC LR0, 7;;",
             ),
-            "execute_fn": "execute_mult_ve_cyclic",
+            "execute_fn": "execute_lr_inc",
         },
-        "MULT.VE.PADDED": {
+        "DEC": {
             "operands": [
-                {"name": "cyclic_offset", "type": "LrIdx", "read": "live"},
-                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
-                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
-                {"name": "fixed_idx", "type": "LrIdx", "read": "live"},
+                {"name": "dest", "type": "LrIdx"},
+                {"name": "imm", "type": "LrIncDecImmediate"},
             ],
             "doc": InstructionDoc(
-                title="Vector-Element Multiply (padded RC)",
+                title="Decrement",
                 summary=(
-                    "Same scalar × RC row as `MULT.VE.CYCLIC`, but indices at or past the 512-byte RC "
-                    "boundary within the 128-element window use a dtype-specific 1 instead of wrapping."
+                    "Subtract an unsigned immediate from the destination LR (read-modify-write)."
                 ),
-                syntax="MULT.VE.PADDED cyclic_offset, mask_offset, mask_shift, fixed_idx",
+                syntax="DEC dest, imm",
                 operands=[
-                    "`cyclic_offset`: **`LR0`**…**`LR15`** — base byte offset into `R_CYCLIC`; out-of-range lanes use dtype 1.",
-                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in `R_MASK`.",
-                    "`mask_shift`: **`LR0`**…**`LR15`** — shift applied to the mask register.",
-                    "`fixed_idx`: **`LR0`**…**`LR15`** (value read live) — scalar index into **`R0`**/**`R1`**.",
+                    "dest: Destination local register (LR0–LR15); also the implicit source",
+                    "imm: Unsigned immediate; range 0 to 2^W − 1 where W is derived from the LR slot union layout",
                 ],
-                operation="For i in [0, 128): rb = R_CYCLIC[cyclic_offset + i] if in bounds else dtype_one; scalar from R0/R1; MULT_RES[i] = scalar * rb (then mask/shift).",
-                example="MULT.VE.PADDED LR0, 0, LR2, LR3;;",
+                operation="dest = dest - imm",
+                example="DEC LR0, 3;;",
             ),
-            "execute_fn": "execute_mult_ve_padded",
+            "execute_fn": "execute_lr_dec",
         },
-        "MULT_NOP": {
+        "ADDB": {
+            "operands": [
+                {"name": "dest", "type": "LrdIdx"},
+                {"name": "src_b", "type": "LcrIdx", "read": "snapshot"},
+            ],
+            "doc": InstructionDoc(
+                title="Add Byte (Broadcast, Register)",
+                summary=(
+                    "Broadcast-add a signed byte from an LR/CR register's low byte to each of "
+                    "the 8 byte elements of an LRDn register pair, saturating each element to [0, 255]."
+                ),
+                syntax="ADDB dest, src_b",
+                operands=[
+                    "dest: Destination register pair (LRD0, LRD2, LRD4, ..., LRD14 — named after the lower register); LRDn = LR(n+1):LR(n), 8 byte elements; also the implicit source",
+                    "src_b: LR0–LR15 or CR0–CR15; low byte is read and reinterpreted as a signed two's-complement byte",
+                ],
+                operation=(
+                    "byte_val = src_b & 0xFF  # interpreted as signed int8 (two's complement)\n"
+                    "for i in 0..7: dest_byte[i] = clamp(dest_byte[i] + byte_val, 0, 255)"
+                ),
+                example="ADDB LRD0, LR3;;\nADDB LRD2, CR5;;",
+                notes=(
+                    "There is no separate subtract opcode: since src_b's byte is reinterpreted as "
+                    "signed, a value ≥ 128 (i.e. negative in two's complement) subtracts from every "
+                    "element instead of adding. E.g. an LR/CR whose low byte is 200 (== -56) decreases "
+                    "each element by 56. Because elements saturate at both ends of [0, 255], subtracting "
+                    "past 0 clamps at 0 rather than wrapping — it does not behave like a plain "
+                    "two's-complement subtract."
+                ),
+            ),
+            "execute_fn": "execute_addb",
+        },
+        "ADDBI": {
+            "operands": [
+                {"name": "dest", "type": "LrdIdx"},
+                {"name": "imm", "type": "AddbiImmediate"},
+            ],
+            "doc": InstructionDoc(
+                title="Add Byte Immediate (Broadcast)",
+                summary=(
+                    "Broadcast-add a signed immediate byte to each of the 8 byte elements of an "
+                    "LRDn register pair, saturating each element to [0, 255]."
+                ),
+                syntax="ADDBI dest, imm",
+                operands=[
+                    "dest: Destination register pair (LRD0, LRD2, LRD4, ..., LRD14 — named after the lower register); LRDn = LR(n+1):LR(n), 8 byte elements; also the implicit source",
+                    "imm: Unsigned byte 0–255 (or an equivalent signed −128–127 literal); reinterpreted as a signed two's-complement byte for the add",
+                ],
+                operation=(
+                    "byte_val = imm  # interpreted as signed int8 (two's complement)\n"
+                    "for i in 0..7: dest_byte[i] = clamp(dest_byte[i] + byte_val, 0, 255)"
+                ),
+                example="ADDBI LRD0, 200;;\nADDBI LRD2, 7;;",
+                notes=(
+                    "There is no separate subtract opcode: write imm as a negative literal (e.g. "
+                    "-56) or its equivalent unsigned encoding (200) to subtract from every element "
+                    "instead of adding — both spellings encode the same bit pattern. Because elements "
+                    "saturate at both ends of [0, 255], subtracting past 0 clamps at 0 rather than "
+                    "wrapping — it does not behave like a plain two's-complement subtract."
+                ),
+            ),
+            "execute_fn": "execute_addbi",
+        },
+        "NOP": {
             "operands": [],
             "doc": InstructionDoc(
-                title="No Operation (MULT)",
+                title="No Operation",
+                summary="No operation for LR slot.",
+                syntax="NOP",
+                operands=[],
+            ),
+            "execute_fn": "execute_lr_nop",
+        },
+    },
+
+    # =========================================================================
+    # MULT Slot (Multiply Instructions)
+    # Opcode = position: MULT.RC.VV=0, MULT.RC.VE=1, MULT.RC.VS=2, NOP=3,
+    #          MULT.VE=4, MULT.EE=5
+    # =========================================================================
+    "mult": {
+        "MULT.RC.VV": {
+            "operands": [
+                {"name": "rc_idx", "type": "LrIdx", "read": "live"},
+                {"name": "ra", "type": "MultStageReg", "read": "snapshot"},
+                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
+                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="RC Vector × Ra Vector Multiply",
+                summary=(
+                    "Multiply R_CYCLIC[rc_idx:rc_idx+128] by Ra (R0 or R1) element-wise. "
+                    "The partition used by mask_shift comes from cr_idx's dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="MULT.RC.VV rc_idx, ra, mask_offset, mask_shift, cr_idx",
+                operands=[
+                    "`rc_idx`: **`LR0`**…**`LR15`** — base ELEMENT index into **`R_CYCLIC`** (cyclic, mod 512 elements; same unit as `LDR_CYCLIC_MULT_REG`'s `index`).",
+                    "`ra`: **`R0`** | **`R1`** — multiplicand mult-stage register (same cycle as `LDR_MULT_REG` into **`R0`**/**`R1`** is allowed).",
+                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
+                    "`mask_shift`: **`LR0`**…**`LR15`** — index ∈ [−3, +3] (values >3 clamp to 3, values <−3 clamp to −3) selecting one of seven masks via sequential shift-and-AND: positive indices use partition_vector (0 at group start), negative indices use inverse_partition_vector (0 at group end).",
+                    "`cr_idx`: **`CR0`**…**`CR15`** — dstructure register supplying the `partition` field used to build the partition vectors and the `pad_mode` field used to fill deactivated elements (must be given explicitly).",
+                ],
+                operation="For each element i: MULT_RES[i] = ipu_mult(R_CYCLIC[(rc_idx + i) % 512], ra[i]); then apply mask and shift using CR[cr_idx].partition.",
+                example="MULT.RC.VV LR0, R0, 0, LR2, CR15;;",
+                notes="Element masking via `mask_offset` and `mask_shift` fills elements whose derived mask bit is **0** (deactivated) in `MULT_RES` with the dstructure register's `pad_mode` value (zero by default, or +inf/-inf for a floating-point dtype) before accumulation; elements with bit **1** pass through. See [Masking](assembly-syntax.md#masking) for the full algorithm.",
+            ),
+            "execute_fn": "execute_mult_rc_vv",
+        },
+        "MULT.RC.VE": {
+            "operands": [
+                {"name": "rc_idx", "type": "LrIdx", "read": "live"},
+                {"name": "src", "type": "LcrIdx"},
+                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
+                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="RC Vector × Scalar Multiply",
+                summary=(
+                    "Multiply R_CYCLIC[rc_idx:rc_idx+128] by a scalar, element-wise. The scalar is "
+                    "either a single element of R0/R1 (selected by an LR value) or a CR register value. "
+                    "The partition used by mask_shift comes from cr_idx's dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="MULT.RC.VE rc_idx, src, mask_offset, mask_shift, cr_idx",
+                operands=[
+                    "`rc_idx`: **`LR0`**…**`LR15`** — base ELEMENT index into **`R_CYCLIC`** (cyclic, mod 512 elements; same unit as `LDR_CYCLIC_MULT_REG`'s `index`).",
+                    "`src`: **`LR0`**…**`LR15`** | **`CR0`**…**`CR15`** — if an LR, its stored value selects the scalar from R0/R1 (0..127 → `R0[idx]`, 128..255 → `R1[idx - 128]`); if a CR, its low byte supplies the scalar directly.",
+                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
+                    "`mask_shift`: **`LR0`**…**`LR15`** — index ∈ [−3, +3] (values >3 clamp to 3, values <−3 clamp to −3) selecting one of seven masks via sequential shift-and-AND: positive indices use partition_vector (0 at group start), negative indices use inverse_partition_vector (0 at group end).",
+                    "`cr_idx`: **`CR0`**…**`CR15`** — dstructure register supplying the `partition` field used to build the partition vectors and the `pad_mode` field used to fill deactivated elements (must be given explicitly).",
+                ],
+                operation="For each element i: MULT_RES[i] = ipu_mult(R_CYCLIC[(rc_idx + i) % 512], src_value); then apply mask and shift using CR[cr_idx].partition.",
+                example="MULT.RC.VE LR0, LR3, 0, LR2, CR15;;",
+                notes="Element masking via `mask_offset` and `mask_shift` fills elements whose derived mask bit is **0** (deactivated) in `MULT_RES` with the dstructure register's `pad_mode` value (zero by default, or +inf/-inf for a floating-point dtype) before accumulation; elements with bit **1** pass through. See [Masking](assembly-syntax.md#masking) for the full algorithm.",
+            ),
+            "execute_fn": "execute_mult_rc_ve",
+        },
+        "MULT.RC.VS": {
+            "operands": [
+                {"name": "rc_idx", "type": "LrIdx", "read": "live"},
+                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
+                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="RC Vector Self-Multiply (Square)",
+                summary=(
+                    "Square R_CYCLIC[rc_idx:rc_idx+128] element-wise. "
+                    "The partition used by mask_shift comes from cr_idx's dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="MULT.RC.VS rc_idx, mask_offset, mask_shift, cr_idx",
+                operands=[
+                    "`rc_idx`: **`LR0`**…**`LR15`** — base ELEMENT index into **`R_CYCLIC`** (cyclic, mod 512 elements; same unit as `LDR_CYCLIC_MULT_REG`'s `index`).",
+                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
+                    "`mask_shift`: **`LR0`**…**`LR15`** — index ∈ [−3, +3] (values >3 clamp to 3, values <−3 clamp to −3) selecting one of seven masks via sequential shift-and-AND: positive indices use partition_vector (0 at group start), negative indices use inverse_partition_vector (0 at group end).",
+                    "`cr_idx`: **`CR0`**…**`CR15`** — dstructure register supplying the `partition` field used to build the partition vectors and the `pad_mode` field used to fill deactivated elements (must be given explicitly).",
+                ],
+                operation="For each element i: rb = R_CYCLIC[(rc_idx + i) % 512]; MULT_RES[i] = ipu_mult(rb, rb); then apply mask and shift using CR[cr_idx].partition.",
+                example="MULT.RC.VS LR0, 0, LR2, CR15;;",
+                notes="Element masking via `mask_offset` and `mask_shift` fills elements whose derived mask bit is **0** (deactivated) in `MULT_RES` with the dstructure register's `pad_mode` value (zero by default, or +inf/-inf for a floating-point dtype) before accumulation; elements with bit **1** pass through. See [Masking](assembly-syntax.md#masking) for the full algorithm.",
+            ),
+            "execute_fn": "execute_mult_rc_vs",
+        },
+        "NOP": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="No Operation",
                 summary="No operation for multiply slot.",
-                syntax="MULT_NOP",
+                syntax="NOP",
                 operands=[],
             ),
             "execute_fn": "execute_mult_nop",
         },
-        "MULT.VE.CR": {
+        "MULT.VE": {
             "operands": [
-                {"name": "cyclic_offset", "type": "LrIdx", "read": "live"},
-                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
-                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "ra_idx", "type": "LrIdx", "read": "live"},
                 {"name": "cr_idx", "type": "CrIdx"},
-            ],
-            "doc": InstructionDoc(
-                title="Vector-Element Multiply (CR scalar)",
-                summary="Multiply each element of RC[cyclic_offset:cyclic_offset+128] by a scalar from a CR register. Elements beyond RC boundary are treated as 1 (dtype-specific).",
-                syntax="MULT.VE.CR cyclic_offset, mask_offset, mask_shift, cr_idx",
-                operands=[
-                    "cyclic_offset: Base offset into RC (cyclic register); non-cyclic — out-of-bounds elements are padded with 1",
-                    "mask_offset: Immediate mask slot 0–7 (128-bit slice of R_MASK)",
-                    "mask_shift: Shift applied to the mask (from LR)",
-                    "cr_idx: CR register whose low byte supplies the fixed scalar multiplier (CR0–CR15)",
-                ],
-                operation="For i in [0,128): rb = RC[cyclic_offset+i] if in bounds else dtype_one; MULT_RES[i] = CR[cr_idx][0] * rb",
-                example="MULT.VE.CR LR0, 0, LR15, CR3;;",
-            ),
-            "execute_fn": "execute_mult_ve_cr",
-        },
-        "MULT.VE.AAQ": {
-            "operands": [
-                {"name": "cyclic_offset", "type": "LrIdx", "read": "live"},
                 {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
                 {"name": "mask_shift", "type": "LrIdx", "read": "live"},
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
+                {"name": "dstructure_cr_idx", "type": "DstructureCrIdx"},
             ],
             "doc": InstructionDoc(
-                title="Vector-Element Multiply (AAQ scalar)",
-                summary="Multiply each element of RC[cyclic_offset:cyclic_offset+128] by a scalar from an AAQ register. Elements beyond RC boundary are treated as 1 (dtype-specific).",
-                syntax="MULT.VE.AAQ cyclic_offset, mask_offset, mask_shift, aaq_rf_idx",
-                operands=[
-                    "cyclic_offset: Base offset into RC (cyclic register); non-cyclic — out-of-bounds elements are padded with 1",
-                    "mask_offset: Immediate mask slot 0–7 (128-bit slice of R_MASK)",
-                    "mask_shift: Shift applied to the mask (from LR)",
-                    "aaq_rf_idx: AAQ register whose low byte supplies the fixed scalar multiplier (AAQ0–AAQ3)",
-                ],
-                operation="For i in [0,128): rb = RC[cyclic_offset+i] if in bounds else dtype_one; MULT_RES[i] = AAQ[aaq_rf_idx][0] * rb",
-                example="MULT.VE.AAQ LR0, 0, LR15, AAQ1;;",
-            ),
-            "execute_fn": "execute_mult_ve_aaq",
-        },
-        "MULT.EE.RR": {
-            "operands": [
-                {"name": "ra", "type": "MultStageReg", "read": "live"},
-                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
-                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
-            ],
-            "doc": InstructionDoc(
-                title="Multi-Element Multiply (register by register)",
+                title="Ra Vector × CR Scalar Multiply",
                 summary=(
-                    "Multi-element execution (MEE): multiply a mult-stage register "
-                    "element by element against itself. `ra` selects the execution "
-                    "mode — **`R0`** gives r0-by-r0, **`R1`** gives r1-by-r1."
+                    "Multiply Ra[ra_idx:ra_idx+128] (combined R0/R1) by a CR scalar, element-wise. "
+                    "The partition used by mask_shift comes from dstructure_cr_idx's dstructure "
+                    "configuration (any CR0-CR15; must be named explicitly)."
                 ),
-                syntax="MULT.EE.RR ra, mask_offset, mask_shift",
+                syntax="MULT.VE ra_idx, cr_idx, mask_offset, mask_shift, dstructure_cr_idx",
                 operands=[
-                    "`ra`: **`R0`** | **`R1`** — selects the MEE mode; the chosen register is both multiplicand and multiplier (same cycle as `LDR_MULT_REG` into **`R0`**/**`R1`** is allowed).",
-                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`r_mask`**.",
-                    "`mask_shift`: **`LR0`**…**`LR15`** — shift applied to the mask register.",
+                    "`ra_idx`: **`LR0`**…**`LR15`** — base byte offset into combined Ra (`R0` ++ `R1`, 256 bytes, cyclic mod 256).",
+                    "`cr_idx`: **`CR0`**…**`CR15`** — CR register whose low byte supplies the scalar multiplier.",
+                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
+                    "`mask_shift`: **`LR0`**…**`LR15`** — index ∈ [−3, +3] (values >3 clamp to 3, values <−3 clamp to −3) selecting one of seven masks via sequential shift-and-AND: positive indices use partition_vector (0 at group start), negative indices use inverse_partition_vector (0 at group end).",
+                    "`dstructure_cr_idx`: **`CR0`**…**`CR15`** — dstructure register supplying the `partition` field used to build the partition vectors and the `pad_mode` field used to fill deactivated elements (must be given explicitly).",
                 ],
-                operation="For each lane i: mult_res[i] = ipu_mult(ra[i], ra[i]); then apply mask and shift.",
-                example="MULT.EE.RR R0, 0, LR2;;",
+                operation="For each element i: ra = Ra[(ra_idx + i) % 256]; MULT_RES[i] = ipu_mult(ra, CR[cr_idx][0]); then apply mask and shift using CR[dstructure_cr_idx].partition.",
+                example="MULT.VE LR0, CR3, 0, LR2, CR15;;",
+                notes="Element masking via `mask_offset` and `mask_shift` fills elements whose derived mask bit is **0** (deactivated) in `MULT_RES` with the dstructure register's `pad_mode` value (zero by default, or +inf/-inf for a floating-point dtype) before accumulation; elements with bit **1** pass through. See [Masking](assembly-syntax.md#masking) for the full algorithm.",
             ),
-            "execute_fn": "execute_mult_ee_rr",
+            "execute_fn": "execute_mult_ve",
+        },
+        "MULT.EE": {
+            "operands": [
+                {"name": "ra_idx", "type": "LrIdx", "read": "live"},
+                {"name": "cr_idx", "type": "CrIdx"},
+                {"name": "mask_offset", "type": "MultMaskOffsetImmediate"},
+                {"name": "mask_shift", "type": "LrIdx", "read": "live"},
+                {"name": "dstructure_cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="Ra Element × CR Scalar Multiply (broadcast)",
+                summary=(
+                    "Multiply a single Ra element by a CR scalar; broadcast the product to all 128 elements. "
+                    "The partition used by mask_shift comes from dstructure_cr_idx's dstructure "
+                    "configuration (any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="MULT.EE ra_idx, cr_idx, mask_offset, mask_shift, dstructure_cr_idx",
+                operands=[
+                    "`ra_idx`: **`LR0`**…**`LR15`** — index of the single Ra element to read (combined `R0` ++ `R1`, 256 bytes, mod 256).",
+                    "`cr_idx`: **`CR0`**…**`CR15`** — CR register whose low byte supplies the scalar multiplier.",
+                    "`mask_offset`: immediate mask slot **`0`**…**`7`** — selects one of eight 128-bit masks in **`R_MASK`**.",
+                    "`mask_shift`: **`LR0`**…**`LR15`** — index ∈ [−3, +3] (values >3 clamp to 3, values <−3 clamp to −3) selecting one of seven masks via sequential shift-and-AND: positive indices use partition_vector (0 at group start), negative indices use inverse_partition_vector (0 at group end).",
+                    "`dstructure_cr_idx`: **`CR0`**…**`CR15`** — dstructure register supplying the `partition` field used to build the partition vectors and the `pad_mode` field used to fill deactivated elements (must be given explicitly).",
+                ],
+                operation="ra = Ra[ra_idx % 256]; result = ipu_mult(ra, CR[cr_idx][0]); for each element i: MULT_RES[i] = result; then apply mask and shift using CR[dstructure_cr_idx].partition.",
+                example="MULT.EE LR0, CR3, 0, LR2, CR15;;",
+                notes="Element masking via `mask_offset` and `mask_shift` fills elements whose derived mask bit is **0** (deactivated) in `MULT_RES` with the dstructure register's `pad_mode` value (zero by default, or +inf/-inf for a floating-point dtype) before accumulation; elements with bit **1** pass through. See [Masking](assembly-syntax.md#masking) for the full algorithm.",
+            ),
+            "execute_fn": "execute_mult_ee",
         },
     },
 
     # =========================================================================
     # ACC Slot (Accumulator Instructions)
-    # Opcode = position: ACC=0, ACC.FIRST=1, RESET_ACC=2, ACC_NOP=3, ACC.ADD_AAQ=4, ACC.ADD_AAQ.FIRST=5, ACC.MAX=6, ACC.MAX.FIRST=7, ACC.STRIDE=8
+    # Opcode = position: ACC.ADD=0, ACC.ADD.FIRST=1, ACC.MAX=2, ACC.MAX.FIRST=3,
+    #          ACC.SUB=4, ACC.SUB.FIRST=5, NOP=6, ACC.STRIDE=7,
+    #          AGG.SUM.FIRST=8, AGG.SUM=9, AGG.MAX.FIRST=10, AGG.MAX=11
     # =========================================================================
     "acc": {
-        "ACC": {
+        "ACC.ADD": {
             "operands": [],
             "doc": InstructionDoc(
-                title="Accumulate",
-                summary="Accumulate multiply result.",
-                syntax="ACC",
+                title="Accumulate Add",
+                summary="Running add accumulation: add multiply result into each R_ACC element.",
+                syntax="ACC.ADD",
                 operands=[],
-                operation="R_ACC += multiply_result",
+                operation="R_ACC[i] += MULT_RES[i]  # for each element i",
+                example="ACC.ADD;;",
             ),
-            "execute_fn": "execute_acc",
+            "execute_fn": "execute_acc_add",
         },
-        "ACC.FIRST": {
+        "ACC.ADD.FIRST": {
             "operands": [],
             "doc": InstructionDoc(
-                title="Accumulate First",
-                summary="Set accumulator to multiply result (do not ADD to previous R_ACC).",
-                syntax="ACC.FIRST",
+                title="Accumulate Add (First)",
+                summary="Clean-init add: overwrite each R_ACC element with the multiply result (ignores previous R_ACC).",
+                syntax="ACC.ADD.FIRST",
                 operands=[],
-                operation="R_ACC = multiply_result",
-                example="ACC.FIRST;;",
+                operation="R_ACC[i] = MULT_RES[i]  # for each element i",
+                example="ACC.ADD.FIRST;;",
             ),
-            "execute_fn": "execute_acc_first",
-        },
-        "RESET_ACC": {
-            "operands": [],
-            "doc": InstructionDoc(
-                title="Reset Accumulator",
-                summary="Reset accumulator to zero.",
-                syntax="RESET_ACC",
-                operands=[],
-                operation="R_ACC = 0",
-            ),
-            "execute_fn": "execute_reset_acc",
-        },
-        "ACC_NOP": {
-            "operands": [],
-            "doc": InstructionDoc(
-                title="No Operation (ACC)",
-                summary="No operation for accumulator slot.",
-                syntax="ACC_NOP",
-                operands=[],
-            ),
-            "execute_fn": "execute_acc_nop",
-        },
-        "ACC.ADD_AAQ": {
-            "operands": [
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
-            "doc": InstructionDoc(
-                title="Accumulate and Add AAQ",
-                summary="Accumulate multiply result, then ADD the selected AAQ register (32-bit) to each of the 128 accumulator words.",
-                syntax="ACC.ADD_AAQ aaq_rf_idx",
-                operands=[
-                    "aaq_rf_idx: AAQ register index (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "R_ACC += multiply_result;\n"
-                    "for i in [0, 128): R_ACC[i] += AAQ_REGS[aaq_rf_idx]"
-                ),
-                example="ACC.ADD_AAQ AAQ0;;",
-            ),
-            "execute_fn": "execute_acc_add_aaq",
-        },
-        "ACC.ADD_AAQ.FIRST": {
-            "operands": [
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
-            "doc": InstructionDoc(
-                title="Accumulate and Add AAQ (First)",
-                summary="Set accumulator to multiply result plus selected AAQ register (do not ADD to previous R_ACC).",
-                syntax="ACC.ADD_AAQ.FIRST aaq_rf_idx",
-                operands=[
-                    "aaq_rf_idx: AAQ register index (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "R_ACC = multiply_result;\n"
-                    "for i in [0, 128): R_ACC[i] += AAQ_REGS[aaq_rf_idx]"
-                ),
-                example="ACC.ADD_AAQ.FIRST AAQ0;;",
-            ),
-            "execute_fn": "execute_acc_add_aaq_first",
+            "execute_fn": "execute_acc_add_first",
         },
         "ACC.MAX": {
-            "operands": [
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
+            "operands": [],
             "doc": InstructionDoc(
-                title="Accumulator Max",
-                summary="For each element, SET R_ACC[i] = max(R_ACC[i], MULT_RES[i], AAQ_REGS[aaq_rf_idx]).",
-                syntax="ACC.MAX aaq_rf_idx",
-                operands=[
-                    "aaq_rf_idx: AAQ register index (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "for i in [0, 128): R_ACC[i] = max(R_ACC[i], MULT_RES[i], AAQ_REGS[aaq_rf_idx])"
-                ),
-                example="ACC.MAX AAQ0;;",
+                title="Accumulate Max",
+                summary="Running max accumulation: each R_ACC element takes the max of its current value and the multiply result.",
+                syntax="ACC.MAX",
+                operands=[],
+                operation="R_ACC[i] = max(R_ACC[i], MULT_RES[i])  # for each element i",
+                example="ACC.MAX;;",
             ),
             "execute_fn": "execute_acc_max",
         },
         "ACC.MAX.FIRST": {
-            "operands": [
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
+            "operands": [],
             "doc": InstructionDoc(
-                title="Accumulator Max (First)",
-                summary="For each element, SET R_ACC[i] = max(MULT_RES[i], AAQ_REGS[aaq_rf_idx]). Previous R_ACC is ignored (treated as 0).",
-                syntax="ACC.MAX.FIRST aaq_rf_idx",
-                operands=[
-                    "aaq_rf_idx: AAQ register index (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "for i in [0, 128): R_ACC[i] = max(MULT_RES[i], AAQ_REGS[aaq_rf_idx])"
-                ),
-                example="ACC.MAX.FIRST AAQ0;;",
+                title="Accumulate Max (First)",
+                summary="Clean-init max: overwrite each R_ACC element unconditionally with the multiply result.",
+                syntax="ACC.MAX.FIRST",
+                operands=[],
+                operation="R_ACC[i] = MULT_RES[i]  # for each element i (unconditional overwrite)",
+                example="ACC.MAX.FIRST;;",
             ),
             "execute_fn": "execute_acc_max_first",
+        },
+        "ACC.SUB": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="Accumulate Subtract",
+                summary="Running subtract accumulation: subtract the multiply result from each R_ACC element each cycle.",
+                syntax="ACC.SUB",
+                operands=[],
+                operation="R_ACC[i] -= MULT_RES[i]  # for each element i",
+                example="ACC.SUB;;",
+            ),
+            "execute_fn": "execute_acc_sub",
+        },
+        "ACC.SUB.FIRST": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="Accumulate Subtract (First)",
+                summary="Clean-init subtract: set each R_ACC element to the negated multiply result.",
+                syntax="ACC.SUB.FIRST",
+                operands=[],
+                operation="R_ACC[i] = -MULT_RES[i]  # for each element i",
+                example="ACC.SUB.FIRST;;",
+            ),
+            "execute_fn": "execute_acc_sub_first",
+        },
+        "NOP": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="No Operation",
+                summary="No operation for accumulator slot.",
+                syntax="NOP",
+                operands=[],
+            ),
+            "execute_fn": "execute_acc_nop",
         },
         "ACC.STRIDE": {
             "operands": [
@@ -651,175 +814,228 @@ INSTRUCTION_SPEC = {
                 summary="Reorder the multiplication result into R_ACC using horizontal/vertical stride decimation. Only updates the RACC indexes written; leaves the rest unchanged.",
                 syntax="ACC.STRIDE elements_in_row, horizontal_stride, vertical_stride, offset",
                 operands=[
-                    "elements_in_row: Elements per row (8, 16, 32, or 64)",
-                    "horizontal_stride: Horizontal stride mode (enabled, inverted, expand)",
+                    "elements_in_row: Elements per row (16, 32, or 64; minimum is 16)",
+                    "horizontal_stride: Horizontal stride mode (off, on, on_inv)",
                     "vertical_stride: Vertical stride mode (enabled, inverted)",
                     "offset: LR register; value % 4 gives start index in RACC (0, 32, 64, or 96)",
                 ],
                 operation=(
-                    "Decimate MULT_RES as rows×cols; apply horizontal stride (take every 2nd column, optional expand); "
-                    "then vertical stride (take every 2nd row). Write result into R_ACC[start:start+N] where start = (offset%4)*32, N = 32|64|128."
+                    "Decimate MULT_RES as rows×cols; apply horizontal stride (take every 2nd column); "
+                    "then vertical stride (take every 2nd row). Write result into R_ACC[start:start+N] where start = (offset%4)*32, N = 32|64|128. "
+                    "When a data structure has fewer than 8 elements, hardware pads to 16 automatically (not programmable)."
                 ),
-                example="ACC.STRIDE 8, off, off, LR0;;",
+                example="ACC.STRIDE 16, off, off, LR0;;",
             ),
             "execute_fn": "execute_acc_stride",
+        },
+        "AGG.SUM.FIRST": {
+            "operands": [
+                {"name": "dest_slot", "type": "LrIdx", "read": "snapshot"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="Aggregate Sum (First)",
+                summary=(
+                    "Sum active MULT_RES elements and write the result into R_ACC at the slot given by LR. "
+                    "The current value at the destination slot is NOT included in the sum (clean initialisation). "
+                    "The active element count and partition come from ``cr_idx``'s dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="AGG.SUM.FIRST dest_slot, cr_idx",
+                operands=[
+                    "dest_slot: LR register whose value gives the destination slot in R_ACC (0–127)",
+                    "cr_idx: CR0…CR15 supplying valid_elements (must be given explicitly)",
+                ],
+                operation=(
+                    "Let n = min(CR[cr_idx].valid_elements, 128). "
+                    "dest = LR[dest_slot] % 128. "
+                    "R_ACC[dest] = sum(MULT_RES[0..n-1])."
+                ),
+                example="AGG.SUM.FIRST LR0, CR3;;",
+            ),
+            "execute_fn": "execute_agg_sum_first",
+        },
+        "AGG.SUM": {
+            "operands": [
+                {"name": "dest_slot", "type": "LrIdx", "read": "snapshot"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="Aggregate Sum",
+                summary=(
+                    "Sum active MULT_RES elements and ADD the result to R_ACC at the slot given by LR "
+                    "(running cross-cycle accumulation). "
+                    "The active element count and partition come from ``cr_idx``'s dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="AGG.SUM dest_slot, cr_idx",
+                operands=[
+                    "dest_slot: LR register whose value gives the destination slot in R_ACC (0–127)",
+                    "cr_idx: CR0…CR15 supplying valid_elements (must be given explicitly)",
+                ],
+                operation=(
+                    "Let n = min(CR[cr_idx].valid_elements, 128). "
+                    "dest = LR[dest_slot] % 128. "
+                    "R_ACC[dest] = sum(MULT_RES[0..n-1]) + R_ACC[dest]."
+                ),
+                example="AGG.SUM LR0, CR3;;",
+            ),
+            "execute_fn": "execute_agg_sum",
+        },
+        "AGG.MAX.FIRST": {
+            "operands": [
+                {"name": "dest_slot", "type": "LrIdx", "read": "snapshot"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="Aggregate Max (First)",
+                summary=(
+                    "Find the maximum of active MULT_RES elements and write it into R_ACC at the slot given by LR. "
+                    "The current value at the destination slot is NOT used as a seed (clean initialisation). "
+                    "The active element count and partition come from ``cr_idx``'s dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="AGG.MAX.FIRST dest_slot, cr_idx",
+                operands=[
+                    "dest_slot: LR register whose value gives the destination slot in R_ACC (0–127)",
+                    "cr_idx: CR0…CR15 supplying valid_elements (must be given explicitly)",
+                ],
+                operation=(
+                    "Let n = min(CR[cr_idx].valid_elements, 128). "
+                    "dest = LR[dest_slot] % 128. "
+                    "R_ACC[dest] = max(MULT_RES[0..n-1]); when n = 0 the identity seed "
+                    "(INT32_MIN for integer elements, -inf for float elements) is written."
+                ),
+                example="AGG.MAX.FIRST LR0, CR3;;",
+            ),
+            "execute_fn": "execute_agg_max_first",
+        },
+        "AGG.MAX": {
+            "operands": [
+                {"name": "dest_slot", "type": "LrIdx", "read": "snapshot"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
+            ],
+            "doc": InstructionDoc(
+                title="Aggregate Max",
+                summary=(
+                    "Find the maximum of active MULT_RES elements seeded with the current destination slot value "
+                    "(running cross-cycle max). "
+                    "The active element count and partition come from ``cr_idx``'s dstructure configuration "
+                    "(any CR0-CR15; must be named explicitly)."
+                ),
+                syntax="AGG.MAX dest_slot, cr_idx",
+                operands=[
+                    "dest_slot: LR register whose value gives the destination slot in R_ACC (0–127)",
+                    "cr_idx: CR0…CR15 supplying valid_elements (must be given explicitly)",
+                ],
+                operation=(
+                    "Let n = min(CR[cr_idx].valid_elements, 128). "
+                    "dest = LR[dest_slot] % 128. "
+                    "R_ACC[dest] = max(MULT_RES[0..n-1], R_ACC[dest])."
+                ),
+                example="AGG.MAX LR0, CR3;;",
+            ),
+            "execute_fn": "execute_agg_max",
+        },
+        "ACC.RESHAPE": {
+            "operands": [
+                {"name": "source", "type": "LrdIdx", "read": "snapshot"},
+                {"name": "dest", "type": "LrdIdx", "read": "snapshot"},
+                {"name": "reshape_mask", "type": "LrOrReshapeMaskImmediate"},
+            ],
+            "doc": InstructionDoc(
+                title="Reshape",
+                summary=(
+                    "Scatter MULT_RES elements into R_ACC: for each of the trailing "
+                    "(8 - reshape_mask) byte elements of the source/dest LRDn pairs "
+                    "(indices reshape_mask..7), copy MULT_RES[source[i]] to R_ACC[dest[i]]."
+                ),
+                syntax="ACC.RESHAPE source, dest, reshape_mask",
+                operands=[
+                    "source: LRDn register pair (LRD0, LRD2, ..., LRD14) read as source[0..7] — 8 byte elements, each a MULT_RES word index",
+                    "dest: LRDn register pair (LRD0, LRD2, ..., LRD14) read as dest[0..7] — 8 byte elements, each an R_ACC word index",
+                    "reshape_mask: immediate 0-7 or an LR register; selects the first participating element index (elements reshape_mask..7 participate; reshape_mask = 0 uses all 8, reshape_mask = 7 uses only element 7). When an LR is given, its full value is used as the mask at runtime.",
+                ],
+                operation=(
+                    "mult_res = MULT_RES (pre-instruction snapshot)\n"
+                    "mask = reshape_mask if immediate else LR[reshape_mask]\n"
+                    "if mask > 8: raise error\n"
+                    "for i in mask..7:\n"
+                    "    if source[i] >= 128 or dest[i] >= 128: raise error\n"
+                    "    R_ACC[dest[i]] = mult_res[source[i]]"
+                ),
+                example="ACC.RESHAPE LRD0, LRD2, 0;;",
+                notes=(
+                    "reshape_mask skips the lowest-indexed elements 0..reshape_mask-1; the "
+                    "rest participate. Example: reshape_mask = 2 skips elements 0, 1; "
+                    "elements 2-7 participate. Example: reshape_mask = 5 skips elements "
+                    "0-4; elements 5-7 participate."
+                ),
+            ),
+            "execute_fn": "execute_acc_reshape",
         },
     },
 
     # =========================================================================
     # AAQ Slot (Activation and Quantization)
-    # Opcode = position: AAQ_NOP=0, AGG=1, AGG.FIRST=2, AAQ=3, ACTIVATE=4
+    # Opcode = position: NOP=0, AAQ=1, ACTIVATE=2
     # =========================================================================
     "aaq": {
-        "AAQ_NOP": {
+        "NOP": {
             "operands": [],
             "doc": InstructionDoc(
-                title="No Operation (AAQ)",
+                title="No Operation",
                 summary="No operation for AAQ slot.",
-                syntax="AAQ_NOP",
+                syntax="NOP",
                 operands=[],
             ),
             "execute_fn": "execute_aaq_nop",
         },
-        "AGG": {
+        "ACTIVATE.QUANTIZE": {
             "operands": [
-                {"name": "agg_mode", "type": "AggMode"},
-                {"name": "post_fn", "type": "PostFn"},
-                {
-                    "name": "valid_elements",
-                    "type": "LcrIdx",
-                    "read": "snapshot",
-                },
-                {"name": "cr_idx", "type": "CrIdx"},
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
-            "doc": InstructionDoc(
-                title="Accumulator Aggregate",
-                summary=(
-                    "Collapse R_ACC lanes into one value (SUM or MAX), using only the first "
-                    "valid_elements words for the tree; apply post function; store to selected AAQ register."
-                ),
-                syntax="AGG agg_mode, post_fn, valid_elements, cr_idx, aaq_rf_idx",
-                operands=[
-                    "agg_mode: sum or max",
-                    "post_fn: value, value_cr, inv, or inv_sqrt",
-                    "valid_elements: lane count from an LR or CR register (value read at cycle start; "
-                    "unsigned, clamped to 0–128; indices [valid_elements..127] are masked out)",
-                    "cr_idx: CR register for value_cr post function (CR0–CR15)",
-                    "aaq_rf_idx: AAQ register to store result (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "Let n = min(valid_elements, 128). "
-                    "If sum: v = sum(R_ACC[0..n-1]). "
-                    "If max: v = max(R_ACC[0..n-1], AAQ[aaq_rf_idx]). "
-                    "Apply post_fn(v): value→v, value_cr→v*cr[cr_idx], inv→1/v, inv_sqrt→1/sqrt(v). "
-                    "AAQ[aaq_rf_idx] = result."
-                ),
-                example="AGG sum, value, LR0, CR0, AAQ0;;",
-            ),
-            "execute_fn": "execute_agg",
-        },
-        "AGG.FIRST": {
-            "operands": [
-                {"name": "agg_mode", "type": "AggMode"},
-                {"name": "post_fn", "type": "PostFn"},
-                {
-                    "name": "valid_elements",
-                    "type": "LcrIdx",
-                    "read": "snapshot",
-                },
-                {"name": "cr_idx", "type": "CrIdx"},
-                {"name": "aaq_rf_idx", "type": "AaqRegIdx"},
-            ],
-            "doc": InstructionDoc(
-                title="Accumulator Aggregate First",
-                summary="Like AGG, but for MAX mode ignores the previous AAQ register value, avoiding contamination from uninitialized data.",
-                syntax="AGG.FIRST agg_mode, post_fn, valid_elements, cr_idx, aaq_rf_idx",
-                operands=[
-                    "agg_mode: sum or max",
-                    "post_fn: value, value_cr, inv, or inv_sqrt",
-                    "valid_elements: lane count from an LR or CR register (value read at cycle start; "
-                    "unsigned, clamped to 0–128; indices [valid_elements..127] are masked out)",
-                    "cr_idx: CR register for value_cr post function (CR0–CR15)",
-                    "aaq_rf_idx: AAQ register to store result (AAQ0–AAQ3)",
-                ],
-                operation=(
-                    "Let n = min(valid_elements, 128). "
-                    "If sum: v = sum(R_ACC[0..n-1]). "
-                    "If max: v = max(R_ACC[0..n-1]) (previous AAQ value is NOT included). "
-                    "Apply post_fn(v): value→v, value_cr→v*cr[cr_idx], inv→1/v, inv_sqrt→1/sqrt(v). "
-                    "AAQ[aaq_rf_idx] = result."
-                ),
-                example="AGG.FIRST max, value, LR0, CR0, AAQ0;;",
-            ),
-            "execute_fn": "execute_agg_first",
-        },
-        "AAQ": {
-            "operands": [],
-            "doc": InstructionDoc(
-                title="AAQ Quantize",
-                summary=(
-                    "Quantize the 128 wide lanes in **`POST_AAQ_REG`** (INT32 per lane in INT8 mode) "
-                    "to INT8, storing clamped bytes in the **leading 128 bytes** of **`POST_AAQ_REG`** "
-                    "and clearing the rest of the register. Wide lanes are normally produced by "
-                    "**`ACTIVATE`** (from ``r_acc``). Requires INT8 mode."
-                ),
-                syntax="AAQ",
-                operands=[],
-                operation=(
-                    "Requires INT8 mode (CR15 == DType.INT8). "
-                    "For i in [0, 128): POST_AAQ_REG[i] = clamp(trunc(POST_AAQ_REG wide lane i), -128, 127); "
-                    "POST_AAQ_REG[128..511] = 0"
-                ),
-                example="AAQ;;",
-            ),
-            "execute_fn": "execute_aaq",
-        },
-        "ACTIVATE": {
-            "operands": [
-                {
-                    "name": "valid_elements",
-                    "type": "LcrIdx",
-                    "read": "snapshot",
-                },
                 {"name": "activation_fn", "type": "ActivationFn"},
+                {"name": "cr_idx", "type": "DstructureCrIdx"},
             ],
             "doc": InstructionDoc(
-                title="Accumulator Activation",
+                title="Activate and Quantize",
                 summary=(
-                    "Read each of the first ``valid_elements`` lanes from ``r_acc``, apply the "
-                    "selected element-wise activation, and write results into the same lane indices "
-                    "of ``POST_AAQ_REG`` (``r_acc`` is unchanged). The activation is "
-                    "selected by keyword (see ACTIVATION_FN_NAMES). Behaviour matches the activation "
-                    "table in the AAQ stage spec (section 7.0). The selector uses four bits; "
-                    "encodings outside the nine named activations behave as identity. The available "
-                    "activation functions are: ``identity`` (0), ``relu`` (1), ``relu6`` (2), "
+                    "Read active elements from ``r_acc`` (snapshot), apply the selected element-wise activation, "
+                    "clamp the results to the INT8 range ``[-128, 127]``, and write the resulting bytes to "
+                    "the leading active-element positions of **``POST_AAQ_REG``**; all remaining bytes are zeroed. "
+                    "``r_acc`` is not modified. Requires INT8 mode. "
+                    "The active element count is taken from ``cr_idx``'s dstructure ``valid_elements`` field "
+                    "(any CR0–CR15; must be named explicitly). "
+                    "Available activation functions: ``identity`` (0), ``relu`` (1), ``relu6`` (2), "
                     "``sigmoid`` (3), ``tanh`` (4), ``gelu`` (5), ``softplus`` (6), ``elu`` (7), "
-                    "``exp2`` (8). For Python emulator calibration (virtual α), see "
-                    "docs/content/building-applications.md#activations-emulator."
+                    "``exp2`` (8), ``reciprocal`` (9), ``rsqrt`` (10), ``silu`` (11)."
                 ),
-                syntax="ACTIVATE valid_elements activation_fn",
+                syntax="ACTIVATE.QUANTIZE activation_fn, cr_idx",
                 operands=[
-                    "valid_elements: lane count from an LR or CR register (unsigned, clamped to 0–128)",
-                    "activation_fn: keyword naming the activation (one of identity, relu, relu6, sigmoid, tanh, gelu, softplus, elu, exp2; see ACTIVATION_FN_NAMES)",
+                    "activation_fn: keyword naming the activation (one of identity, relu, relu6, sigmoid, tanh, gelu, softplus, elu, exp2, reciprocal, rsqrt, silu; see ACTIVATION_FN_NAMES)",
+                    "cr_idx: CR0…CR15 supplying valid_elements (must be given explicitly)",
                 ],
                 operation=(
-                    "Let n = min(valid_elements, 128) and k = encoded activation index. "
-                    "For i in [0, n): POST_AAQ_REG[i] = activation_k(R_ACC[i]) (same 32-bit lane format as R_ACC). "
-                    "R_ACC is not modified. The selector uses four bits; encodings outside the nine named "
-                    "activations behave as identity. "
+                    "Requires INT8 mode (IpuState.dtype == DType.INT8). "
+                    "Let n = min(CR[cr_idx].valid_elements, 128) and k = encoded activation index. "
+                    "For i in [0, n): POST_AAQ_REG[i] = clamp(round(activation_k(R_ACC[i])), -128, 127). "
+                    "POST_AAQ_REG[n..511] = 0. R_ACC is not modified. "
+                    "Clamping is a placeholder until a full per-element requantize is implemented. "
+                    "The selector uses four bits; encodings outside the twelve named activations behave as identity. "
                     "α for elu is not an ISA operand; see "
                     "docs/content/building-applications.md#activations-emulator."
                 ),
-                example="ACTIVATE LR0 relu;;",
+                example="ACTIVATE.QUANTIZE relu, CR15;;",
             ),
-            "execute_fn": "execute_activate",
+            "execute_fn": "execute_activate_quantize",
         },
     },
 
     # =========================================================================
     # COND Slot (Conditional Branch Instructions)
-    # Opcode = position: BEQ=0, BNE=1, BLT=2, BNZ=3, BZ=4, B=5, BR=6, BKPT=7
+    # Opcode = position: BEQ=0, BNE=1, BLT=2, BGE=3, BR=4, BKPT=5, NOP=6
+    # BNZ, BZ, and B are pseudo-instructions (see PSEUDO_INSTRUCTION_SPEC):
+    # they're each exactly expressible via BEQ/BNE against CR0 (always zero),
+    # so they don't need their own opcode.
     # =========================================================================
     "cond": {
         "BEQ": {
@@ -882,59 +1098,25 @@ INSTRUCTION_SPEC = {
             ),
             "execute_fn": "execute_blt",
         },
-        "BNZ": {
+        "BGE": {
             "operands": [
-                {"name": "test_reg", "type": "LcrIdx", "read": "snapshot"},
-                {"name": "base_reg", "type": "LcrIdx", "read": "snapshot"},
+                {"name": "reg1", "type": "LcrIdx", "read": "snapshot"},
+                {"name": "reg2", "type": "LcrIdx", "read": "snapshot"},
                 {"name": "label", "type": "Label"},
             ],
             "doc": InstructionDoc(
-                title="Branch if Not Zero",
-                summary="Branch if test register not equal to base register.",
-                syntax="BNZ test_reg, base_reg, label",
+                title="Branch if Greater or Equal",
+                summary="Branch if first register is greater than or equal to second.",
+                syntax="BGE reg1, reg2, label",
                 operands=[
-                    "test_reg: Register to test (LR0–LR15 or CR0–CR15)",
-                    "base_reg: Base comparison register (LR0–LR15 or CR0–CR15)",
+                    "reg1: First register to compare (LR0–LR15 or CR0–CR15)",
+                    "reg2: Second register to compare (LR0–LR15 or CR0–CR15)",
                     "label: Branch target label",
                 ],
-                operation="if (test_reg != base_reg) PC = label",
-                example="BNZ LR3, LR0, loop;;",
+                operation="if (reg1 >= reg2) PC = label",
+                example="BGE LR0, CR1, ge;;",
             ),
-            "execute_fn": "execute_bnz",
-        },
-        "BZ": {
-            "operands": [
-                {"name": "test_reg", "type": "LcrIdx", "read": "snapshot"},
-                {"name": "base_reg", "type": "LcrIdx", "read": "snapshot"},
-                {"name": "label", "type": "Label"},
-            ],
-            "doc": InstructionDoc(
-                title="Branch if Zero",
-                summary="Branch if test register equals base register.",
-                syntax="BZ test_reg, base_reg, label",
-                operands=[
-                    "test_reg: Register to test (LR0–LR15 or CR0–CR15)",
-                    "base_reg: Base comparison register (LR0–LR15 or CR0–CR15)",
-                    "label: Branch target label",
-                ],
-                operation="if (test_reg == base_reg) PC = label",
-                example="BZ LR0, LR1, zero;;",
-            ),
-            "execute_fn": "execute_bz",
-        },
-        "B": {
-            "operands": [
-                {"name": "label", "type": "Label"},
-            ],
-            "doc": InstructionDoc(
-                title="Unconditional Branch",
-                summary="Always branch to label.",
-                syntax="B label",
-                operands=["label: Branch target label"],
-                operation="PC = label",
-                example="B start;;",
-            ),
-            "execute_fn": "execute_b",
+            "execute_fn": "execute_bge",
         },
         "BR": {
             "operands": [
@@ -960,11 +1142,21 @@ INSTRUCTION_SPEC = {
             ),
             "execute_fn": "execute_bkpt",
         },
+        "NOP": {
+            "operands": [],
+            "doc": InstructionDoc(
+                title="No Operation",
+                summary="No operation for COND slot; advances PC by one.",
+                syntax="NOP",
+                operands=[],
+            ),
+            "execute_fn": "execute_cond_nop",
+        },
     },
 
     # =========================================================================
     # BREAK Slot (Break Instructions)
-    # Opcode = position: BREAK=0, BREAK.IFEQ=1, BREAK_NOP=2
+    # Opcode = position: BREAK=0, BREAK.IFEQ=1, NOP=2
     # =========================================================================
     "break": {
         "BREAK": {
@@ -996,12 +1188,12 @@ INSTRUCTION_SPEC = {
             ),
             "execute_fn": "execute_break_ifeq",
         },
-        "BREAK_NOP": {
+        "NOP": {
             "operands": [],
             "doc": InstructionDoc(
-                title="No Operation (BREAK)",
+                title="No Operation",
                 summary="No operation for BREAK slot.",
-                syntax="BREAK_NOP",
+                syntax="NOP",
                 operands=[],
             ),
             "execute_fn": "execute_break_nop",
@@ -1030,8 +1222,8 @@ def get_opcode_for_instruction(slot_type: str, instruction_name: str) -> int:
     """Get opcode index for an instruction (derived from its position).
     
     Args:
-        slot_type: Slot type (e.g., "xmem", "lr", "mult")
-        instruction_name: Instruction name (e.g., "STR_ACC_REG")
+        slot_type: Slot type (e.g., "load", "store", "lr", "mult")
+        instruction_name: Instruction name (e.g., "LDR_MULT_REG")
     
     Returns:
         Opcode index (0-based position in slot's instruction list)
@@ -1055,8 +1247,8 @@ def extract_opcodes() -> Dict[str, List[str]]:
     
     Example:
         {
-            "xmem": ["STR_ACC_REG", "LDR_MULT_REG", ...],
-            "lr": ["SET", "ADD", "SUB", "INCR_MOD_POW2"],
+            "load": ["LDR_MULT_REG", "LDR_CYCLIC_MULT_REG", ...],
+            "lr": ["SET", "ADD", "SUB", "INCR_MOD_POW2", "INC", "DEC"],
             ...
         }
     """
@@ -1070,8 +1262,8 @@ def get_instruction(slot_type: str, instruction_name: str) -> dict:
     """Look up a specific instruction definition.
     
     Args:
-        slot_type: Slot type (e.g., "xmem", "lr", "mult")
-        instruction_name: Instruction name (e.g., "STR_ACC_REG")
+        slot_type: Slot type (e.g., "load", "store", "lr", "mult")
+        instruction_name: Instruction name (e.g., "LDR_MULT_REG")
     
     Returns:
         The instruction definition dict with "operands", "doc", "execute_fn"
@@ -1086,7 +1278,7 @@ def get_instruction_by_opcode(slot_type: str, opcode_index: int) -> Tuple[str, d
     """Look up instruction by slot type and opcode (position-based).
     
     Args:
-        slot_type: Slot type (e.g., "xmem", "lr")
+        slot_type: Slot type (e.g., "load", "lr")
         opcode_index: 0-based opcode index
     
     Returns:
@@ -1122,7 +1314,7 @@ def create_assembler_opcodes() -> Dict[str, Type]:
     
     Returns a dict of dynamically created Opcode subclasses:
         {
-            "XmemInstOpcode": <class>,
+            "LoadInstOpcode": <class>,
             "LrInstOpcode": <class>,
             ...
         }
@@ -1145,7 +1337,9 @@ def create_assembler_opcodes() -> Dict[str, Type]:
             )
     
     slot_to_class_name = {
-        "xmem": "XmemInstOpcode",
+        "load": "LoadInstOpcode",
+        "store": "StoreInstOpcode",
+        "acc_store": "AccStoreInstOpcode",
         "lr": "LrInstOpcode",
         "mult": "MultInstOpcode",
         "acc": "AccInstOpcode",
@@ -1185,7 +1379,9 @@ def create_emulator_constants() -> Dict[str, int]:
         }
     """
     slot_to_prefix = {
-        "xmem": "XMEM_OP",
+        "load": "LOAD_OP",
+        "store": "STORE_OP",
+        "acc_store": "ACC_STORE_OP",
         "lr": "LR_OP",
         "mult": "MULT_OP",
         "acc": "ACC_OP",
@@ -1221,20 +1417,198 @@ VALID_OPERAND_TYPES: frozenset[str] = frozenset(
         "LrIdx",
         "CrIdx",
         "LcrIdx",
-        "AaqRegIdx",
+        "LrdIdx",
         "ElementsInRow",
         "HorizontalStride",
         "VerticalStride",
-        "AggMode",
-        "PostFn",
         "LrModPow2KImmediate",
+        "LrIncDecImmediate",
+        "AddbiImmediate",
         "MultMaskOffsetImmediate",
+        "LrOrReshapeMaskImmediate",
         "ActivationFn",
         "BreakImmediate",
         "Label",
-        "AddSubSrcB",
+        "DstructureCrIdx",
     }
 )
+
+
+# ===========================================================================
+# Pseudo-Instruction Specification (assembler-only — no opcode, no execute_fn)
+# ===========================================================================
+#
+# Pseudo-instructions are aliases that the assembler expands into a real
+# INSTRUCTION_SPEC entry at compile time. They are NEVER assigned an opcode
+# and NEVER appear in the binary, so they need no emulator handler — only
+# an "expands_to" mapping onto an existing real instruction.
+#
+# Looked up by (name, operand count): this lets a pseudo-instruction share
+# a name with a real instruction of a different arity without ambiguity
+# (e.g. the 2-operand pseudo "BZ reg, label" below vs. the 3-operand real
+# hardware "BZ test_reg, base_reg, label").
+#
+# Structure:
+#     PSEUDO_INSTRUCTION_SPEC = {
+#         "name": {
+#             "operands": [{"name": "reg1", "type": "LcrIdx"}, ...],
+#             "expands_to": {
+#                 "slot": "cond",
+#                 "instruction": "BLT",
+#                 "args": ["reg2", "reg1", "label"],
+#                     # Real instruction's operands, in order. Each entry is
+#                     # either a name from this pseudo's own "operands" list
+#                     # (substituted with the caller's actual token), or a
+#                     # literal register name such as "CR0" (assumed to
+#                     # always hold zero, used to derive BZ/BNZ from
+#                     # BEQ/BNE).
+#             },
+#             "doc": InstructionDoc(...),
+#         },
+#         ...
+#     }
+
+PSEUDO_INSTRUCTION_SPEC: dict[str, dict] = {
+    "BGT": {
+        "operands": [
+            {"name": "reg1", "type": "LcrIdx"},
+            {"name": "reg2", "type": "LcrIdx"},
+            {"name": "label", "type": "Label"},
+        ],
+        "expands_to": {
+            "slot": "cond",
+            "instruction": "BLT",
+            "args": ["reg2", "reg1", "label"],
+        },
+        "doc": InstructionDoc(
+            title="Branch if Greater Than (pseudo)",
+            summary="Branch if first register is greater than second.",
+            syntax="BGT reg1, reg2, label",
+            operands=[
+                "reg1: First register to compare (LR0–LR15 or CR0–CR15)",
+                "reg2: Second register to compare (LR0–LR15 or CR0–CR15)",
+                "label: Branch target label",
+            ],
+            operation="if (reg1 > reg2) PC = label",
+            example="BGT LR0, LR1, bigger;;",
+            notes=(
+                "Expands to `BLT reg2, reg1, label` at assemble time "
+                "(operands swapped). Identical encoding and runtime cost "
+                "to a hand-written BLT."
+            ),
+        ),
+    },
+    "BLE": {
+        "operands": [
+            {"name": "reg1", "type": "LcrIdx"},
+            {"name": "reg2", "type": "LcrIdx"},
+            {"name": "label", "type": "Label"},
+        ],
+        "expands_to": {
+            "slot": "cond",
+            "instruction": "BGE",
+            "args": ["reg2", "reg1", "label"],
+        },
+        "doc": InstructionDoc(
+            title="Branch if Less or Equal (pseudo)",
+            summary="Branch if first register is less than or equal to second.",
+            syntax="BLE reg1, reg2, label",
+            operands=[
+                "reg1: First register to compare (LR0–LR15 or CR0–CR15)",
+                "reg2: Second register to compare (LR0–LR15 or CR0–CR15)",
+                "label: Branch target label",
+            ],
+            operation="if (reg1 <= reg2) PC = label",
+            example="BLE LR0, LR1, smaller_or_equal;;",
+            notes=(
+                "Expands to `BGE reg2, reg1, label` at assemble time "
+                "(operands swapped), exactly mirroring how BGT expands to "
+                "BLT. Identical encoding and runtime cost to a hand-written "
+                "BGE."
+            ),
+        ),
+    },
+    "BZ": {
+        "operands": [
+            {"name": "reg", "type": "LcrIdx"},
+            {"name": "label", "type": "Label"},
+        ],
+        "expands_to": {
+            "slot": "cond",
+            "instruction": "BEQ",
+            "args": ["reg", "CR0", "label"],
+        },
+        "doc": InstructionDoc(
+            title="Branch if Zero (pseudo)",
+            summary="Branch if register is zero. Assumes CR0 always holds zero.",
+            syntax="BZ reg, label",
+            operands=[
+                "reg: Register to test (LR0–LR15 or CR0–CR15)",
+                "label: Branch target label",
+            ],
+            operation="if (reg == 0) PC = label",
+            example="BZ LR0, done;;",
+            notes="Expands to `BEQ reg, CR0, label`. Assumes CR0 always holds 0.",
+        ),
+    },
+    "BNZ": {
+        "operands": [
+            {"name": "reg", "type": "LcrIdx"},
+            {"name": "label", "type": "Label"},
+        ],
+        "expands_to": {
+            "slot": "cond",
+            "instruction": "BNE",
+            "args": ["reg", "CR0", "label"],
+        },
+        "doc": InstructionDoc(
+            title="Branch if Not Zero (pseudo)",
+            summary="Branch if register is not zero. Assumes CR0 always holds zero.",
+            syntax="BNZ reg, label",
+            operands=[
+                "reg: Register to test (LR0–LR15 or CR0–CR15)",
+                "label: Branch target label",
+            ],
+            operation="if (reg != 0) PC = label",
+            example="BNZ LR0, loop;;",
+            notes="Expands to `BNE reg, CR0, label`. Assumes CR0 always holds 0.",
+        ),
+    },
+    "B": {
+        "operands": [
+            {"name": "label", "type": "Label"},
+        ],
+        "expands_to": {
+            "slot": "cond",
+            "instruction": "BEQ",
+            "args": ["CR0", "CR0", "label"],
+        },
+        "doc": InstructionDoc(
+            title="Unconditional Branch (pseudo)",
+            summary="Always branch to label.",
+            syntax="B label",
+            operands=["label: Branch target label"],
+            operation="PC = label",
+            example="B start;;",
+            notes="Expands to `BEQ CR0, CR0, label`. CR0 always equals itself, so the branch is always taken.",
+        ),
+    },
+}
+
+
+def find_pseudo_instruction(name: str, arg_count: int) -> dict | None:
+    """Look up a pseudo-instruction definition by name and operand count.
+
+    Matching is case-insensitive on the name AND requires an exact operand
+    count match, so a pseudo-instruction never shadows a real instruction
+    of a different arity sharing the same name. Returns None if no
+    pseudo-instruction matches.
+    """
+    lowered = name.lower()
+    for pseudo_name, pseudo_def in PSEUDO_INSTRUCTION_SPEC.items():
+        if pseudo_name.lower() == lowered and len(pseudo_def["operands"]) == arg_count:
+            return pseudo_def
+    return None
 
 
 # ===========================================================================
@@ -1324,8 +1698,92 @@ def validate_instruction_spec() -> None:
                 )
 
 
+def validate_pseudo_instruction_spec() -> None:
+    """Validate pseudo-instruction specification consistency.
+
+    Checks:
+    - Each pseudo-instruction has 'operands', 'expands_to', and 'doc'
+    - No pseudo-instruction defines 'execute_fn' (they never reach the
+      emulator — only the assembler expands them)
+    - Operands have name/type fields with a recognized type
+    - 'expands_to' references a real slot + instruction that actually
+      exists in INSTRUCTION_SPEC, with a matching operand count
+    - Each 'expands_to.args' entry is either one of this pseudo's own
+      operand names or a literal string (e.g. "CR0")
+
+    Raises ValueError if validation fails.
+    """
+    for name, pseudo_def in PSEUDO_INSTRUCTION_SPEC.items():
+        if "operands" not in pseudo_def:
+            raise ValueError(f"pseudo.{name}: missing 'operands' field")
+        if "expands_to" not in pseudo_def:
+            raise ValueError(f"pseudo.{name}: missing 'expands_to' field")
+        if "doc" not in pseudo_def:
+            raise ValueError(f"pseudo.{name}: missing 'doc' field")
+        if "execute_fn" in pseudo_def:
+            raise ValueError(
+                f"pseudo.{name}: pseudo-instructions must not define "
+                f"'execute_fn' — they expand to a real instruction at "
+                f"assemble time and never reach the emulator"
+            )
+
+        operands = pseudo_def["operands"]
+        if not isinstance(operands, list):
+            raise ValueError(f"pseudo.{name}: 'operands' must be a list of dicts")
+
+        operand_names = set()
+        for operand in operands:
+            if "name" not in operand or "type" not in operand:
+                raise ValueError(
+                    f"pseudo.{name}: each operand needs a 'name' and 'type'"
+                )
+            if operand["type"] not in VALID_OPERAND_TYPES:
+                raise ValueError(
+                    f"pseudo.{name}: operand '{operand['name']}' has invalid "
+                    f"type '{operand['type']}'"
+                )
+            operand_names.add(operand["name"])
+
+        if not isinstance(pseudo_def["doc"], InstructionDoc):
+            raise ValueError(f"pseudo.{name}: 'doc' must be InstructionDoc instance")
+
+        expansion = pseudo_def["expands_to"]
+        if not isinstance(expansion, dict):
+            raise ValueError(f"pseudo.{name}: 'expands_to' must be a dict")
+
+        slot = expansion.get("slot")
+        real_instruction = expansion.get("instruction")
+        args = expansion.get("args")
+
+        if slot not in INSTRUCTION_SPEC:
+            raise ValueError(
+                f"pseudo.{name}: expands_to.slot '{slot}' is not a valid slot"
+            )
+        try:
+            real_def = get_instruction(slot, real_instruction)
+        except KeyError:
+            raise ValueError(
+                f"pseudo.{name}: expands_to.instruction '{real_instruction}' "
+                f"not found in slot '{slot}'"
+            )
+
+        if not isinstance(args, list):
+            raise ValueError(f"pseudo.{name}: 'expands_to.args' must be a list")
+        if len(args) != len(real_def["operands"]):
+            raise ValueError(
+                f"pseudo.{name}: expands_to.args has {len(args)} entries but "
+                f"{slot}.{real_instruction} takes {len(real_def['operands'])} operands"
+            )
+        for arg in args:
+            if not isinstance(arg, str):
+                raise ValueError(
+                    f"pseudo.{name}: expands_to.args entries must be strings"
+                )
+
+
 # Validate on import
 validate_instruction_spec()
+validate_pseudo_instruction_spec()
 
 # Derive union layout from INSTRUCTION_SPEC (must run after spec is fully defined).
 from ipu_common.union_layout import compute_slot_layouts, SlotUnion  # noqa: E402

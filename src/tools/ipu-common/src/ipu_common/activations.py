@@ -1,12 +1,12 @@
-"""Element-wise activation functions for IPU accumulator lanes.
+"""Element-wise activation functions for IPU accumulator elements.
 
 Encodings match ``docs/content/specs/stage-aaq.md`` section 7.0. α for
 ``elu`` defaults to ``DEFAULT_ELU_ALPHA`` below; override per run via
 :class:`ipu_emu.ipu_state.IpuState` constructor or
 :meth:`IpuState.set_activation_alphas` (not CR-visible). Assembly uses
 ``ACTIVATE … <name>`` where ``<name>`` is one of the strings in
-``ACTIVATION_FN_NAMES`` (same order as ids **0**–**8**); the emulator writes
-activated lanes into ``POST_AAQ_REG``. See
+``ACTIVATION_FN_NAMES`` (same order as ids **0**–**11**); the emulator writes
+activated elements into ``POST_AAQ_REG``. See
 ``docs/content/building-applications.md#activations-emulator`` for calibration,
 ``STR_POST_AAQ_REG`` (store that register to XMEM), and pipeline notes.
 """
@@ -24,8 +24,11 @@ ACTIVATION_GELU = 5
 ACTIVATION_SOFTPLUS = 6
 ACTIVATION_ELU = 7
 ACTIVATION_EXP2 = 8
+ACTIVATION_RECIPROCAL = 9
+ACTIVATION_RSQRT = 10
+ACTIVATION_SILU = 11
 
-ACTIVATION_COUNT = 9
+ACTIVATION_COUNT = 12
 
 # Assembly / encoding order (id = index); must match ACTIVATION_* constants above.
 ACTIVATION_FN_NAMES: tuple[str, ...] = (
@@ -38,6 +41,9 @@ ACTIVATION_FN_NAMES: tuple[str, ...] = (
     "softplus",
     "elu",
     "exp2",
+    "reciprocal",
+    "rsqrt",
+    "silu",
 )
 
 # Default α value — virtual configuration outside the ISA (issue #77).
@@ -75,7 +81,7 @@ def apply_activation(
     *,
     elu_alpha: float | None = None,
 ) -> float:
-    """Apply activation ``fn_id`` (0–8) to scalar ``x``. Unknown ids → identity.
+    """Apply activation ``fn_id`` (0–11) to scalar ``x``. Unknown ids → identity.
 
     If ``elu_alpha`` is omitted, the value comes from the module
     ``DEFAULT_ELU_ALPHA`` constant (snapshotted onto
@@ -106,4 +112,10 @@ def apply_activation(
         return x if x >= 0.0 else ea * (math.exp(x) - 1.0)
     if k == ACTIVATION_EXP2:
         return math.exp(x * math.log(2.0))
+    if k == ACTIVATION_RECIPROCAL:
+        return 1.0 / x if x != 0.0 else 0.0
+    if k == ACTIVATION_RSQRT:
+        return 1.0 / math.sqrt(x) if x > 0.0 else 0.0
+    if k == ACTIVATION_SILU:
+        return x * _sigmoid(x)
     return x
