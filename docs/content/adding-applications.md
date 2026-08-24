@@ -18,7 +18,7 @@ app package and touch no central routing logic.
 | 5 | Bazel targets | `src/tools/ipu-apps/BUILD.bazel` |
 
 Nesting depth is free — discovery recurses, so
-`convolutions_universal/conv/conv_universal/` works exactly like
+`convolutions_universal/conv/conv1x1_fp32/` works exactly like
 `softmax/softmax_rows/`.
 
 ## 1. The harness

@@ -73,6 +73,7 @@ nav:
   - Kernels:
       - Overview: kernels/index.md
       - Softmax: kernels/softmax.md
+      - Convolution: kernels/conv2d.md
       - Application Coverage: app-coverage.md
       - Adding Applications: adding-applications.md
   - Contributing:

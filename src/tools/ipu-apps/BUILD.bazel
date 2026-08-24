@@ -159,6 +159,24 @@ py_pytest_test(
     ],
 )
 
+# -- convolution apps (FP32 wide-vector) -----------------------------------
+#
+# Assembles the .asm in-process (assemble_to_bin_file in the test fixture), so
+# the app .asm is provided as data; no pre-assembled .bin target is needed.
+
+py_pytest_test(
+    name = "test_conv1x1_fp32",
+    srcs = ["test/test_conv1x1_fp32.py"],
+    data = [
+        "src/ipu_apps/convolutions_universal/conv/conv1x1_fp32/conv1x1_fp32.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
 # Router only -- no .asm needed; it constructs apps but never runs them.
 py_pytest_test(
     name = "test_softmax_registry",
