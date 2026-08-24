@@ -38,6 +38,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ipu_emu.xmem import XMEM_SIZE_BYTES
+
 from ipu_apps.kernel_registry import (
     MalformedQuery,
     ShapeBundle,
@@ -50,10 +52,11 @@ from ipu_apps.kernel_registry import (
 LANES = 128            # elements per XMEM row (fixed by the 128-element datapath)
 ROW_BYTES = LANES * 4  # 512 bytes per FP32 row in wide-vector debug mode
 
-# XMEM is allocated 8 MiB and wide-vector debug mode addresses all of it as
-# 512-byte rows. Every conv region is sized in rows, so this is the single
-# budget every kernel's `supports` checks against.
-XMEM_ROWS = (8 << 20) // ROW_BYTES  # 16384
+# Wide-vector debug mode addresses the whole XMEM allocation as 512-byte rows.
+# Derived from the emulator's own constant rather than restated: a second copy
+# of the memory size would silently make every refusal below wrong if XMEM were
+# ever resized.
+XMEM_ROWS = XMEM_SIZE_BYTES // ROW_BYTES  # 16384
 
 # Row 0 is deliberately left outside every region: an address that defaulted to
 # zero is then detectably wrong rather than silently landing in the input.

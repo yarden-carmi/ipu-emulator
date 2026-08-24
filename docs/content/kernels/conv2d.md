@@ -217,15 +217,45 @@ rather than in the load. Three vertically-neighbouring rows occupy slots 0, 1
 and 2, and one walking index steps through all nine taps in weight order:
 
 ```
-tap  1  2  3    4    5    6    7    8    9
-rc   0  1  2  128  129  130  256  257  258
-step +1 +1 +1 +126  +1   +1  +126  +1   +1
+tap  1     2  3    4    5   6    7    8  9
+rc   0     1  2  128  129 130  256  257 258
+step -258 +1 +1  +126  +1  +1  +126  +1  +1
 ```
 
-Only two step constants, `CR1` (=1) and `CR14` (=126). `rc_idx` is read live,
-so the same-word add lands before the read and the index is seeded to `-1`.
-A second index walks `+1` in lockstep through `R0`, which is why the weights
-are simply `W[o, ci].ravel()` — `(kr, kc)` row-major, nine per channel.
+Three step constants: `CR1` (=1), `CR14` (=126) and an LR holding `-258`.
+`rc_idx` is read live, so the same-word add lands before the read; tap 1's
+step wraps the index from 258 back to 0 in place, so the per-channel reset
+costs no word of its own. A second index walks `+1` in lockstep through `R0`,
+which is why the weights are simply `W[o, ci].ravel()` — `(kr, kc)` row-major,
+nine per channel.
+
+### The pipelined channel loop (3×3): 9 words, 9 MACs
+
+The three row loads and the loop branch all hide inside the nine tap words, so
+the MULT slot issues every cycle. Slots are read `0,0,0 / 1,1,1 / 2,2,2`, which
+frees each one three taps before it is next needed:
+
+```
+tap 1   read slot 0 | load slot 2 <- THIS channel's row y+2
+tap 4   read slot 1 | load slot 0 <- NEXT channel's row y
+tap 7   read slot 2 | load slot 1 <- NEXT channel's row y+1
+tap 9   read slot 2 | branch
+```
+
+Every load lands six words before its first read — necessary because
+`MULT.RC.*` reads `R_CYCLIC` from the start-of-word **snapshot**, so a load
+co-issued with its consuming multiply would be one word too late. (The ZDconv
+kernel this is modelled on co-issues them; that ISA made a load visible in its
+own cycle. This one does not, so the schedule is re-derived rather than
+copied.) The last channel prefetches into the **guard plane**, which is what
+the `+1` on the input region is for.
+
+`lr_addr` walks one delta per load, cycling `+TPR, +H*TPR, +TPR`. `BLT` sits in
+tap 9 and reads `lr_done` pre-increment, so the group bound is stored as
+`gend-1`.
+
+This took the 3×3 kernel from 14 words per input channel to **9** — a measured
+1.51× on every channel-rich layer.
 
 ### Exact channel groups
 
@@ -258,9 +288,11 @@ depends on:
   is an assembly-time immediate), not a flag.
 - **Strided, dilated, grouped and depthwise convolutions**, and window sizes
   other than 1×1 and 3×3. All are refused by name rather than approximated.
-- **Row-band tiling for inputs over the XMEM budget.** The refusal already
-  reports the largest band that would fit, but the host has to do the banding.
-- **Pipelining the 3×3 channel loop.** It currently spends 14 words per input
-  channel: three row loads, a pointer walk, and the nine taps. Issuing the next
-  channel's loads inside the current channel's taps — slot 0 is dead from tap 4
-  and slot 1 from tap 7 — would bring that to about 10.
+- **Row packing for narrow widths.** `_mult_mask_and_shift` supports a
+  `partition` field that splits the 128 lanes into groups and, on a `mask_shift`
+  of ±1, zeroes the lane at each group's start/end — exactly a row border, free,
+  as an operand of the multiply. With `partition = 128/W` several spatial rows
+  could share one XMEM row with no halo at all, taking lane utilisation to 100%.
+  It applies only where `W ∈ {8, 16, 32, 64}` (the `Partition` enum's group
+  sizes), so it would be a large win for small feature maps and no help to
+  SuperPoint, whose widths are 640/320/160/80.

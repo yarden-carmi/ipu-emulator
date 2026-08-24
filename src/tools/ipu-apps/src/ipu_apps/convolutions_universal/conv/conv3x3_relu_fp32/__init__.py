@@ -311,7 +311,10 @@ class Conv3x3ReluFp32App(IpuApp):
         # CR12 = 128: the R_CYCLIC slot-1 index AND the Ra element index that
         # selects R1[0] = bias[o] (both just need the constant 128).
         state.regfile.set_cr(12, LANES)
-        state.regfile.set_cr(13, self.group_cap)
+        # CR13 = cap-1: added to lr_done it yields the group's LAST channel
+        # index, which is what tap 9's BLT compares against (it reads lr_done
+        # pre-increment).
+        state.regfile.set_cr(13, self.group_cap - 1)
         # CR14 = 126: the tap walk's slot-to-slot step (128 - 2, since the
         # three kc taps within a slot have already advanced the index by 2).
         state.regfile.set_cr(14, LANES - 2)
