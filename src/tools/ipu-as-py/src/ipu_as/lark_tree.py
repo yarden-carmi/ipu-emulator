@@ -1,3 +1,4 @@
+import functools
 import os
 import lark
 import jinja2
@@ -11,6 +12,30 @@ from ipu_common.instruction_spec import (
 )
 
 IPU_INSTR_ADDR_JUMP = 1
+
+
+@functools.lru_cache(maxsize=1)
+def get_parser() -> lark.Lark:
+    """The single parser-construction site, shared by the assembler and tooling.
+
+    Cached because building a LALR parser is not cheap and `parse()` is called
+    once per assembled file; it used to be rebuilt on every call.
+    """
+    script_dir = os.path.dirname(__file__)
+    return lark.Lark.open(
+        os.path.join(script_dir, "asm_grammar.lark"), start="start", parser="lalr"
+    )
+
+
+def parse_tree(text: str) -> lark.Tree:
+    """Render Jinja, then parse, **raising** `lark.exceptions.LarkError`.
+
+    `parse()` below prints and exits, which suits the CLI but makes failures
+    unobservable to callers. Tooling and tests use this instead.
+    """
+    if any(marker in text for marker in ["{{", "{%", "{#"]):
+        text = jinja2.Template(text).render()
+    return get_parser().parse(text)
 
 
 def _is_real_instruction_name(name: str) -> bool:
@@ -134,18 +159,8 @@ def parse(text: str) -> list[dict[str, any]]:
     # calls. (App harnesses, tests, and benchmarks assemble several .asm files in
     # one process rather than spawning a fresh process per file.)
     ipu_label.reset_labels()
-    # Check if text contains Jinja statements and preprocess if needed
-    if any(marker in text for marker in ['{{', '{%', '{#']):
-        template = jinja2.Template(text)
-        text = template.render()
-    
-    script_dir = os.path.dirname(__file__)
-    parser = lark.Lark.open(
-        os.path.join(script_dir, "asm_grammar.lark"), start="start", parser="lalr"
-    )
-
     try:
-        tree = parser.parse(text)
+        tree = parse_tree(text)
         ast = ASTBuilder().transform(tree)
         return ast
     except lark.exceptions.LarkError as e:

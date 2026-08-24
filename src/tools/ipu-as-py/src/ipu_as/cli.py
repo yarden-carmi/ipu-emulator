@@ -1,5 +1,8 @@
+import json
+import sys
+
 import click
-from ipu_as import gen_codegen, lark_tree
+from ipu_as import diagnostics, gen_codegen, lark_tree
 
 
 @click.group()
@@ -55,9 +58,42 @@ def sv_package(output: str):
     click.echo(f"Wrote SystemVerilog package to {output}")
 
 
+@click.command()
+@click.option("--input", type=click.Path(exists=True), required=True)
+@click.option(
+    "--json/--text",
+    "as_json",
+    default=False,
+    help="Emit machine-readable diagnostics (used by the VS Code extension).",
+)
+def check(input: click.Path, as_json: bool):
+    """Report errors in an assembly source without producing output.
+
+    Unlike `assemble`, this never exits on the first problem and never writes a
+    file — it reports position, so an editor can place a squiggle. Exit code is
+    0 when the source assembles cleanly and 1 when it does not.
+    """
+    found = diagnostics.check(open(input).read())
+
+    if as_json:
+        # stdout is the protocol here; keep it pure JSON.
+        json.dump([d.to_dict() for d in found], sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        for d in found:
+            where = f"{input}:{d.line + 1}:{d.column + 1}"
+            suffix = " (position approximate)" if d.approximate else ""
+            click.echo(f"{where}: {d.severity}: {d.message}{suffix}", err=True)
+        if not found:
+            click.echo(f"{input}: ok")
+
+    sys.exit(1 if found else 0)
+
+
 cli.add_command(assemble)
 cli.add_command(disassemble)
 cli.add_command(sv_package)
+cli.add_command(check)
 
 if __name__ == "__main__":
     cli()
