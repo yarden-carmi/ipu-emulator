@@ -165,10 +165,10 @@ py_pytest_test(
 # the app .asm is provided as data; no pre-assembled .bin target is needed.
 
 py_pytest_test(
-    name = "test_conv1x1_fp32",
-    srcs = ["test/test_conv1x1_fp32.py"],
+    name = "test_conv1x1",
+    srcs = ["test/test_conv1x1.py"],
     data = [
-        "src/ipu_apps/convolutions_universal/conv/conv1x1_fp32/conv1x1_fp32.asm",
+        "src/ipu_apps/convolutions_universal/conv/conv1x1/conv1x1.asm",
     ],
     imports = ["src"],
     deps = [
@@ -178,10 +178,10 @@ py_pytest_test(
 )
 
 py_pytest_test(
-    name = "test_conv3x3_relu_fp32",
-    srcs = ["test/test_conv3x3_relu_fp32.py"],
+    name = "test_conv3x3_relu",
+    srcs = ["test/test_conv3x3_relu.py"],
     data = [
-        "src/ipu_apps/convolutions_universal/conv/conv3x3_relu_fp32/conv3x3_relu_fp32.asm",
+        "src/ipu_apps/convolutions_universal/conv/conv3x3_relu/conv3x3_relu.asm",
     ],
     imports = ["src"],
     deps = [

@@ -54,12 +54,12 @@ not lifted by FP32. Group size is exact (``min(14, Cin - done)``).
 
 Usage::
 
-    from ipu_apps.convolutions_universal.conv.conv3x3_relu_fp32 import (
-        Conv3x3ReluFp32App,
+    from ipu_apps.convolutions_universal.conv.conv3x3_relu import (
+        Conv3x3ReluApp,
     )
 
-    app = Conv3x3ReluFp32App(
-        inst_path="conv3x3_relu_fp32.bin",
+    app = Conv3x3ReluApp(
+        inst_path="conv3x3_relu.bin",
         input_path="x.bin",        # Cin*H*W FP32, channel-major
         weight_path="w.bin",       # Cout*Cin*3*3 FP32, (kr, kc) row-major
         bias_path="b.bin",         # Cout FP32 (optional; zeros when absent)
@@ -107,7 +107,7 @@ PAD_ROWS = 1
 ACTIVATION = "relu"
 
 
-class Conv3x3ReluFp32App(IpuApp):
+class Conv3x3ReluApp(IpuApp):
     """3x3 FP32 convolution + bias + ReLU over a ``(Cin, H, W)`` activation.
 
     Args:
@@ -374,7 +374,7 @@ def _supports(**params):
     if q.kh != KERNEL_SIZE or q.kw != KERNEL_SIZE:
         return no(
             f"is {KERNEL_SIZE}x{KERNEL_SIZE}; this weight is {q.kh}x{q.kw}. "
-            f"A 1x1 weight has its own kernel (conv1x1_fp32); other window "
+            f"A 1x1 weight has its own kernel (conv1x1); other window "
             f"sizes have none."
         )
     bad = activation_refusal(q, ACTIVATION)
@@ -431,11 +431,11 @@ def _caveats(**params):
 
 
 SPEC = KernelSpec(
-    name="conv3x3_relu_fp32",
+    name="conv3x3_relu",
     op="conv2d",
-    variant="dense3x3_relu_fp32",
-    app_class=Conv3x3ReluFp32App,
-    asm="conv3x3_relu_fp32.asm",
+    variant="dense3x3_relu",
+    app_class=Conv3x3ReluApp,
+    asm="conv3x3_relu.asm",
     # The geometry parameters are required rather than defaulted on purpose: a
     # conv spec that silently assumed stride 1 would answer for an operation no
     # kernel here computes. `activation` is likewise part of the query, because

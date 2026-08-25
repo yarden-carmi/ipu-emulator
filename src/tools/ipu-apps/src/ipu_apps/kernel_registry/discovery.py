@@ -9,7 +9,7 @@ Two properties this has to hold:
 
 * **Arbitrary depth.** ``softmax`` nests kernels one level down, but the
   convolution family nests them three (``convolutions_universal/conv/
-  conv1x1_fp32/``). Recursion is not optional.
+  conv1x1/``). Recursion is not optional.
 * **Tolerance of broken or half-present packages.** A working tree can easily
   contain directories that are not importable -- stale ``__pycache__`` shells
   left behind by a branch switch, a kernel mid-authoring, an optional

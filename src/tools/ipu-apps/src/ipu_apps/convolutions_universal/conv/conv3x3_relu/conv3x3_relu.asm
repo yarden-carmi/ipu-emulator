@@ -1,5 +1,5 @@
 {#- ==========================================================================
-    conv3x3_relu_fp32.asm -- 3x3 FP32 convolution + bias + ReLU, zero-padded
+    conv3x3_relu.asm -- 3x3 FP32 convolution + bias + ReLU, zero-padded
 
     out[o, y, x] = relu( bias[o]
                          + SUM_ci SUM_kr SUM_kc W[o,ci,kr,kc] * in[ci, y+kr, x+kc] )

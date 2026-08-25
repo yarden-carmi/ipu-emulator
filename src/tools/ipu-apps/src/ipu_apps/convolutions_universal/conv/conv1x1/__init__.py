@@ -32,10 +32,10 @@ output file is a dense ``(Cout, H, W)`` FP32 array.
 
 Usage::
 
-    from ipu_apps.convolutions_universal.conv.conv1x1_fp32 import Conv1x1Fp32App
+    from ipu_apps.convolutions_universal.conv.conv1x1 import Conv1x1App
 
-    app = Conv1x1Fp32App(
-        inst_path="conv1x1_fp32.bin",
+    app = Conv1x1App(
+        inst_path="conv1x1.bin",
         input_path="x.bin",        # Cin*H*W FP32, channel-major
         weight_path="w.bin",       # Cout*Cin FP32
         bias_path="b.bin",         # Cout FP32 (optional; zeros when absent)
@@ -86,7 +86,7 @@ PAD_ROWS = 0
 ACTIVATION = NO_ACTIVATION
 
 
-class Conv1x1Fp32App(IpuApp):
+class Conv1x1App(IpuApp):
     """Pointwise FP32 convolution over a ``(Cin, H, W)`` activation.
 
     Args:
@@ -368,11 +368,11 @@ def _caveats(**params):
 
 
 SPEC = KernelSpec(
-    name="conv1x1_fp32",
+    name="conv1x1",
     op="conv2d",
-    variant="pointwise_fp32",
-    app_class=Conv1x1Fp32App,
-    asm="conv1x1_fp32.asm",
+    variant="pointwise",
+    app_class=Conv1x1App,
+    asm="conv1x1.asm",
     # Every callback below indexes these, so the registry checks them first: an
     # omitted parameter is then a refusal naming what is missing. The geometry
     # parameters are required rather than defaulted on purpose -- a conv spec

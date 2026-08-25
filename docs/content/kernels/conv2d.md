@@ -5,8 +5,8 @@ mode only** (`wide_vector_debug=True`) with no narrow (INT8/FP8) variant:
 
 | Kernel | Computes | Fused activation |
 |---|---|---|
-| `conv1x1_fp32` | pointwise (1×1), stride 1, no padding | none |
-| `conv3x3_relu_fp32` | 3×3, stride 1, zero-padded by 1 | **ReLU** |
+| `conv1x1` | pointwise (1×1), stride 1, no padding | none |
+| `conv3x3_relu` | 3×3, stride 1, zero-padded by 1 | **ReLU** |
 
 Both loop over output channels internally, so one launch produces the whole
 `(Cout, H, W)` result.
@@ -14,9 +14,9 @@ Both loop over output channels internally, so one launch produces the whole
 ## What they compute
 
 ```
-conv1x1_fp32        out[o,y,x] =      bias[o] + SUM_ci W[o,ci] * in[ci,y,x]
+conv1x1        out[o,y,x] =      bias[o] + SUM_ci W[o,ci] * in[ci,y,x]
 
-conv3x3_relu_fp32   out[o,y,x] = relu(bias[o] + SUM_ci SUM_kr SUM_kc
+conv3x3_relu   out[o,y,x] = relu(bias[o] + SUM_ci SUM_kr SUM_kc
                                       W[o,ci,kr,kc] * in[ci, y+kr, x+kc])
 ```
 
@@ -36,8 +36,8 @@ one activation and cannot be asked for another at run time.
 That makes `activation` a query parameter rather than a detail:
 
 ```python
-resolve("conv2d", ..., activation="relu")   # -> conv3x3_relu_fp32
-resolve("conv2d", ..., activation="none")   # -> conv1x1_fp32 (1x1 only)
+resolve("conv2d", ..., activation="relu")   # -> conv3x3_relu
+resolve("conv2d", ..., activation="none")   # -> conv1x1 (1x1 only)
 ```
 
 Omitting it means `"none"`. A caller asking for a plain 3×3 convolution is
@@ -98,8 +98,8 @@ border a plane (`PAD`).
 
 | | `TC` | `PAD` | weights/channel | group cap |
 |---|---|---|---|---|
-| `conv1x1_fp32` | 128 | 0 | 1 | 128 |
-| `conv3x3_relu_fp32` | 126 | 1 | 9 | 14 |
+| `conv1x1` | 128 | 0 | 1 | 128 |
+| `conv3x3_relu` | 126 | 1 | 9 | 14 |
 
 With `TPR = ceil(W / TC)` rows per spatial row and `NGROUPS = ceil(Cin / cap)`:
 

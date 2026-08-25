@@ -66,7 +66,7 @@ so the guard and the router cannot disagree.
 properties matter:
 
 - **Arbitrary depth.** Softmax nests kernels one level down; the convolution
-  family nests them three (`convolutions_universal/conv/conv1x1_fp32/`).
+  family nests them three (`convolutions_universal/conv/conv1x1/`).
 - **Tolerance of broken packages.** A working tree routinely contains modules
   that will not import — a kernel mid-authoring, a stale directory left by a
   branch switch, an uninstalled optional dependency. Those are recorded as

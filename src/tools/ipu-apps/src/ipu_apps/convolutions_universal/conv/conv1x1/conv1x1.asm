@@ -1,5 +1,5 @@
 {#- ==========================================================================
-    conv1x1_fp32.asm -- pointwise (1x1) FP32 convolution, all output channels
+    conv1x1.asm -- pointwise (1x1) FP32 convolution, all output channels
 
     out[o, y, x] = bias[o] + SUM_ci W[o, ci] * in[ci, y, x]
 

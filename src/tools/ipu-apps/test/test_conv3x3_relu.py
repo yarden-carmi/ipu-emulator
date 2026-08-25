@@ -9,17 +9,17 @@ import numpy as np
 import pytest
 
 from ipu_as.lark_tree import assemble_to_bin_file
-from ipu_apps.convolutions_universal.conv.conv3x3_relu_fp32 import (
+from ipu_apps.convolutions_universal.conv.conv3x3_relu import (
     SPEC,
     TILE_COLS,
-    Conv3x3ReluFp32App,
+    Conv3x3ReluApp,
 )
 from ipu_apps.kernel_registry import MalformedQuery, resolve
 
 ASM_PATH = (
     Path(__file__).resolve().parents[1]
-    / "src/ipu_apps/convolutions_universal/conv/conv3x3_relu_fp32"
-    / "conv3x3_relu_fp32.asm"
+    / "src/ipu_apps/convolutions_universal/conv/conv3x3_relu"
+    / "conv3x3_relu.asm"
 )
 
 TOL = 1e-4
@@ -74,7 +74,7 @@ def _naive_reference(x, w, b):
 @pytest.fixture(scope="module")
 def inst_file():
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "conv3x3_relu_fp32.bin"
+        path = Path(tmp) / "conv3x3_relu.bin"
         assemble_to_bin_file(ASM_PATH.read_text(), str(path))
         yield path
 
@@ -91,7 +91,7 @@ def _run(inst_file, tmp_path, x, w, b) -> np.ndarray:
     cin, h, width = x.shape
     cout = w.shape[0]
     xp, wp, bp, op = _write(tmp_path, x, w, b)
-    app = Conv3x3ReluFp32App(
+    app = Conv3x3ReluApp(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -215,7 +215,7 @@ def test_zero_bias_when_no_bias_file(inst_file, tmp_path):
     cin, cout, h, w = 2, 2, 3, 8
     x, weights, _ = _random_case(cin, cout, h, w, seed=3)
     xp, wp, _, op = _write(tmp_path, x, weights, np.zeros(cout, dtype=np.float32))
-    app = Conv3x3ReluFp32App(
+    app = Conv3x3ReluApp(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -236,7 +236,7 @@ def test_output_file_layout_is_dense(inst_file, tmp_path):
     cin, cout, h, w = 3, 4, 3, 130   # 130 -> two tiles, partially filled
     x, weights, bias = _random_case(cin, cout, h, w, seed=5)
     xp, wp, bp, op = _write(tmp_path, x, weights, bias)
-    app = Conv3x3ReluFp32App(
+    app = Conv3x3ReluApp(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -304,7 +304,7 @@ def test_registry_resolves_to_this_kernel(inst_file, tmp_path):
         activation="relu",
     )
     assert verdict.supported, verdict.reason
-    assert verdict.app_name == "conv3x3_relu_fp32"
+    assert verdict.app_name == "conv3x3_relu"
     assert verdict.shapes["output"] == (cout, h, w)
     assert any("ReLU is fused" in c for c in verdict.caveats), verdict.caveats
 
@@ -390,7 +390,7 @@ def test_constructor_guard_matches_spec(overrides, ctor):
     assert not resolve("conv2d", **params).supported
 
     with pytest.raises(ValueError):
-        Conv3x3ReluFp32App(
+        Conv3x3ReluApp(
             inst_path="unused.bin",
             input_path="unused.bin",
             weight_path="unused.bin",

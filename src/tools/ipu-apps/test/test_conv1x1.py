@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 
 from ipu_as.lark_tree import assemble_to_bin_file
-from ipu_apps.convolutions_universal.conv.conv1x1_fp32 import SPEC, Conv1x1Fp32App
+from ipu_apps.convolutions_universal.conv.conv1x1 import SPEC, Conv1x1App
 from ipu_apps.kernel_registry import MalformedQuery, resolve
 
 ASM_PATH = (
     Path(__file__).resolve().parents[1]
-    / "src/ipu_apps/convolutions_universal/conv/conv1x1_fp32/conv1x1_fp32.asm"
+    / "src/ipu_apps/convolutions_universal/conv/conv1x1/conv1x1.asm"
 )
 
 TOL = 1e-4
@@ -48,7 +48,7 @@ def _naive_reference(x, w, b):
 @pytest.fixture(scope="module")
 def inst_file():
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "conv1x1_fp32.bin"
+        path = Path(tmp) / "conv1x1.bin"
         assemble_to_bin_file(ASM_PATH.read_text(), str(path))
         yield path
 
@@ -65,7 +65,7 @@ def _run(inst_file, tmp_path, x, w, b) -> np.ndarray:
     w.astype("<f4").tofile(wp)
     b.astype("<f4").tofile(bp)
 
-    app = Conv1x1Fp32App(
+    app = Conv1x1App(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -146,7 +146,7 @@ def test_zero_bias_when_no_bias_file(inst_file, tmp_path):
     xp, wp, op = tmp_path / "x.bin", tmp_path / "w.bin", tmp_path / "y.bin"
     x.tofile(xp)
     weights.tofile(wp)
-    app = Conv1x1Fp32App(
+    app = Conv1x1App(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -175,7 +175,7 @@ def test_padding_lanes_are_computed_but_excluded(inst_file, tmp_path):
     x.tofile(xp)
     weights.tofile(wp)
     bias.tofile(bp)
-    app = Conv1x1Fp32App(
+    app = Conv1x1App(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -213,7 +213,7 @@ def test_output_file_layout_is_dense(inst_file, tmp_path):
     x.tofile(xp)
     weights.tofile(wp)
     bias.tofile(bp)
-    app = Conv1x1Fp32App(
+    app = Conv1x1App(
         inst_path=inst_file,
         input_path=xp,
         weight_path=wp,
@@ -248,7 +248,7 @@ def test_registry_resolves_to_this_kernel(inst_file, tmp_path):
         groups=1,
     )
     assert verdict.supported, verdict.reason
-    assert verdict.app_name == "conv1x1_fp32"
+    assert verdict.app_name == "conv1x1"
     assert verdict.shapes["output"] == (cout, h, w)
     assert "output" in verdict.shapes.derived_roles
 
@@ -359,7 +359,7 @@ def test_constructor_guard_matches_spec(overrides, ctor):
     assert not resolve("conv2d", **query).supported
 
     with pytest.raises(ValueError):
-        Conv1x1Fp32App(
+        Conv1x1App(
             inst_path="unused.bin",
             input_path="unused.bin",
             weight_path="unused.bin",
