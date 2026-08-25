@@ -74,6 +74,11 @@ nav:
       - Overview: kernels/index.md
       - Softmax: kernels/softmax.md
       - Convolution: kernels/conv2d.md
+      - Pooling: kernels/pooling.md
+      - Normalization: kernels/normalize.md
+      - Reshape: kernels/reshape.md
+      - Detector head: kernels/detect.md
+      - SuperPoint layer map: kernels/superpoint.md
       - Application Coverage: app-coverage.md
       - Adding Applications: adding-applications.md
   - Contributing:

@@ -190,6 +190,113 @@ py_pytest_test(
     ],
 )
 
+# -- pooling apps (FP32 wide-vector) ---------------------------------------
+#
+# Assembles the .asm in-process (assemble_to_bin_file in the test fixture), so
+# the app .asm is provided as data; no pre-assembled .bin target is needed.
+
+py_pytest_test(
+    name = "test_maxpool2d_halve",
+    srcs = ["test/test_maxpool2d_halve.py"],
+    data = [
+        "src/ipu_apps/pooling/maxpool2d_halve/maxpool2d_halve.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+py_pytest_test(
+    name = "test_maxpool2d_window",
+    srcs = ["test/test_maxpool2d_window.py"],
+    data = [
+        "src/ipu_apps/pooling/maxpool2d_window/maxpool2d_window.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+# -- normalization apps (FP32 wide-vector) ---------------------------------
+
+py_pytest_test(
+    name = "test_l2_normalize_channels",
+    srcs = ["test/test_l2_normalize_channels.py"],
+    data = [
+        "src/ipu_apps/normalize/l2_normalize_channels/l2_normalize_channels.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+# -- reshape apps (FP32 wide-vector) ---------------------------------------
+
+py_pytest_test(
+    name = "test_depth_to_space",
+    srcs = ["test/test_depth_to_space.py"],
+    data = [
+        "src/ipu_apps/reshape/depth_to_space/depth_to_space.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+# -- detector-head apps (FP32 wide-vector) ---------------------------------
+
+py_pytest_test(
+    name = "test_channel_peak",
+    srcs = ["test/test_channel_peak.py"],
+    data = [
+        "src/ipu_apps/detect/channel_peak/channel_peak.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+py_pytest_test(
+    name = "test_score_threshold",
+    srcs = ["test/test_score_threshold.py"],
+    data = [
+        "src/ipu_apps/detect/score_threshold/score_threshold.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+# cell_nms is not a kernel: it decomposes into three that already exist. This
+# target tests that composition, so the claim in the docs cannot go stale.
+py_pytest_test(
+    name = "test_cell_nms_composition",
+    srcs = ["test/test_cell_nms_composition.py"],
+    data = [
+        "src/ipu_apps/convolutions_universal/conv/conv1x1/conv1x1.asm",
+        "src/ipu_apps/detect/channel_peak/channel_peak.asm",
+        "src/ipu_apps/softmax/softmax_columns/softmax_columns.asm",
+        "src/ipu_apps/softmax/softmax_columns_packed/softmax_columns_packed.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
 # Router only -- no .asm needed; it constructs apps but never runs them.
 py_pytest_test(
     name = "test_softmax_registry",
