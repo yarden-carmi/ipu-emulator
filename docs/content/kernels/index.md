@@ -51,7 +51,7 @@ covers the shape, what each candidate objected to.
 |---|---|
 | `softmax` | 5 — see [Softmax](softmax.md) |
 | `conv2d` | 2 — see [Convolution](conv2d.md) |
-| `maxpool2d` | 2 — see [Pooling](pooling.md) |
+| `maxpool2d` | 4 — see [Pooling](pooling.md) |
 | `l2_normalize` | 1 — see [Normalization](normalize.md) |
 | `depth_to_space` | 1 — see [Reshape](reshape.md) |
 | `channel_peak` | 1 — see [Detector head](detect.md) |

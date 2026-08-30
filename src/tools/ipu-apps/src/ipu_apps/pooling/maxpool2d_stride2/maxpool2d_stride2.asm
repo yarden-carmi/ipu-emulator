@@ -1,5 +1,5 @@
 {#- ==========================================================================
-    maxpool2d_halve.asm -- 2x2 stride-2 max-pool, FP32 wide-vector mode
+    maxpool2d_stride2.asm -- 2x2 stride-2 max-pool, FP32 wide-vector mode
 
     out[c, y, x] = max( in[c, 2y,   2x], in[c, 2y,   2x+1],
                         in[c, 2y+1, 2x], in[c, 2y+1, 2x+1] )

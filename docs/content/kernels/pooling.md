@@ -5,25 +5,33 @@ only** (`wide_vector_debug=True`) with no narrow (INT8/FP8) variant:
 
 | Kernel | Computes | Output extent |
 |---|---|---|
-| `maxpool2d_halve` | 2×2 window, stride 2, no padding | `(C, H//2, W//2)` |
+| `maxpool2d_stride2` | 2×2 window, stride 2, no padding | `(C, H//2, W//2)` |
 | `maxpool2d_window` | K×K window (K odd), stride 1, padded by `K//2` | `(C, H, W)` |
+| `maxpool2d_nms9` | **unrolled** 9×9, stride 1, padding 4 | `(C, H, W)` |
+| `maxpool2d_nms7` | **unrolled** 7×7, stride 1, padding 3 | `(C, H, W)` |
 
-Both loop over channels internally, so one launch pools the whole tensor.
+All four loop over channels internally, so one launch pools the whole tensor.
 
-Their domains are **disjoint** — one is stride 2, the other stride 1 — so
-`cost` never decides between them, and each one's refusal names the other.
+`maxpool2d_stride2`'s domain is disjoint from the rest — it is the only
+stride-2 kernel — so `cost` never decides there, and its refusal names the
+others.
+
+The two `nms` kernels **overlap** `maxpool2d_window` on purpose: they compute
+exactly what it computes at K=9 and K=7, about 30% faster, and win on cost.
+`maxpool2d_window` still claims those windows (its `supports` states its true
+domain) and appears as the alternative in the verdict.
 
 ## What they compute
 
 ```
-maxpool2d_halve    out[c,y,x] = max( in[c, 2y,   2x], in[c, 2y,   2x+1],
+maxpool2d_stride2    out[c,y,x] = max( in[c, 2y,   2x], in[c, 2y,   2x+1],
                                      in[c, 2y+1, 2x], in[c, 2y+1, 2x+1] )
 
 maxpool2d_window   out[c,y,x] = max over dy,dx in [0,K)
                                     of pad(in)[c, y+dy-P, x+dx-P],  P = K//2
 ```
 
-`maxpool2d_halve` is `nn.MaxPool2d(2, 2)` — the layer SuperPoint applies after
+`maxpool2d_stride2` is `nn.MaxPool2d(2, 2)` — the layer SuperPoint applies after
 `conv1b`, `conv2b` and `conv3b`. An odd `H` or `W` drops the trailing row or
 column, matching `ceil_mode=False`; the verdict says so as a caveat, because a
 silently dropped row is exactly the kind of thing that should not be silent.
@@ -44,7 +52,7 @@ shift moves into the register instead — `dx` is a `+1` step on the read index.
 
 The two kernels then diverge on where the *rows* live.
 
-`maxpool2d_halve` needs two spatial rows at once and holds both, in R_CYCLIC
+`maxpool2d_stride2` needs two spatial rows at once and holds both, in R_CYCLIC
 slots 0/1 and 2/3 — the second slot of each pair supplies element 128, which is
 where the `dx=1` tap of the last lane lands.
 
@@ -73,12 +81,66 @@ does not write untouched: half A lands at base 0, half B at base 64.
 This is the step the original hand-written kernels documented as permanently
 host-side (*"stride-2 decimation is a host gather"*). It is not.
 
+## Unrolling K, and what it buys
+
+`maxpool2d_window` takes `K` as a run-time CR, so one 19-word binary serves
+every window size. That generality has a fixed price, because a uniform loop
+body cannot peel or pipeline:
+
+```
+per output tile:   K² + 3K + 5 words
+```
+
+The `3K` is three words per `dy` row that are not taps — the row load, a **dead
+separation word** (R_CYCLIC's *contents* come from the start-of-word snapshot,
+so a load needs a word before its first consumer), and the `dy` branch. The `5`
+is the tile prologue, the accumulator seed, the store and the loop control.
+
+Fixing `K` and emitting every tap removes all three:
+
+| | general | unrolled | why |
+|---|---|---|---|
+| row load latency | 1 dead word per row | none | the load is issued inside the *previous* row's taps and lands nine words early |
+| accumulator seed | resident `-FLT_MAX` row + 1 word/tile | none | tap (0,0) simply **is** `ACC.MAX.FIRST` |
+| one-past prefetch | needs a guard row | none | the last two rows just do not issue a load |
+
+```
+per output tile:   K² + 5 words
+```
+
+Measured at 480×640 against `torch.nn.functional.max_pool2d`, both bit-exact:
+
+| K | general | unrolled | speedup |
+|---|---|---:|---:|
+| 9 | 326,887 | **249,127** | **1.31×** |
+| 7 | 217,447 | **156,967** | **1.39×** |
+
+### Three rotating R_CYCLIC slots, not two
+
+Row `dy` is read from slot `dy % 3` while row `dy + 2` loads into slot
+`(dy + 2) % 3` — the slot holding row `dy - 1`, whose taps are finished. **Two
+slots cannot do this**: the one not being read holds the row needed next. Rows
+0 and 1 are preloaded before the tap stream.
+
+### Where it stops
+
+The tile body *is* `K²` words, so the program grows quadratically:
+
+| K | tap words | total | fits the 128-word IMEM bank? |
+|---|---|---|---|
+| 7 | 49 | **64** | yes |
+| 9 | 81 | **96** | yes |
+| 11 | 121 | ~136 | **no** |
+
+K=9 — SuperPoint's default — fits with 32 words to spare; K=11 does not fit at
+all. That, and not effort, is why there is no `nms11`.
+
 ## Memory layout
 
 All sizes in 128-element rows; one row is 512 bytes in wide-vector debug mode.
 
 ```
-maxpool2d_halve     input    C planes x H spatial rows x IN_ROW_STRIDE rows
+maxpool2d_stride2     input    C planes x H spatial rows x IN_ROW_STRIDE rows
                     scratch  2 rows (one per half of the output row)
                     output   C planes x (H//2) rows x OUT_TILES_PER_ROW rows
 
@@ -97,7 +159,7 @@ any valid lane reads is `(TC-1) + (K-1) = 127` — the last element of the slot,
 with nothing to spare. A wide window therefore costs lanes: `K = 9` leaves 120
 usable columns of every 128.
 
-`maxpool2d_halve` spends **no** lanes on a halo. One output XMEM row is 128
+`maxpool2d_stride2` spends **no** lanes on a halo. One output XMEM row is 128
 output columns and so spans 256 input columns — two full-width input tiles —
 and the `+1` shift is satisfied by loading the *next* tile rather than by
 reserving lanes. `IN_ROW_STRIDE` is sized from what the kernel reads
@@ -114,7 +176,7 @@ padded plane, the columns past `W` in a partly-filled tile, and the guard tiles.
 For `maxpool2d_window` this **is** the border: a centred window at the image
 edge genuinely reads outside the image, and no other fill value is correct.
 
-For `maxpool2d_halve` it is not — output lane `j < W//2` reads input columns
+For `maxpool2d_stride2` it is not — output lane `j < W//2` reads input columns
 `2j` and `2j+1`, both below `W`, so no kept output ever touches a filled lane.
 It is filled anyway, so the discarded lanes stay finite and debuggable rather
 than holding whatever was there before.

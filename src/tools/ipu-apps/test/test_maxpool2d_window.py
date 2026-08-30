@@ -236,8 +236,10 @@ def _params(**overrides):
 
 
 def test_registry_resolves_to_this_kernel(inst_file, tmp_path):
+    # K=9 and K=7 now belong to the unrolled maxpool2d_nms9/nms7, which win on
+    # cost; this kernel is the general fallback for every other odd window.
     c, h, w = 2, 8, 40
-    verdict = resolve("maxpool2d", shape=(c, h, w), kernel_size=9, stride=1, padding=4)
+    verdict = resolve("maxpool2d", shape=(c, h, w), kernel_size=11, stride=1, padding=5)
     assert verdict.supported, verdict.reason
     assert verdict.app_name == "maxpool2d_window"
     assert verdict.shapes["output"] == (c, h, w)
@@ -251,7 +253,7 @@ def test_registry_resolves_to_this_kernel(inst_file, tmp_path):
     )
     app.run(max_cycles=200_000_000)
     out = np.frombuffer(op.read_bytes(), dtype="<f4").reshape(c, h, w)
-    assert np.array_equal(out.astype(np.float64), _reference(x, 9))
+    assert np.array_equal(out.astype(np.float64), _reference(x, 11))
 
 
 def test_the_two_pooling_kernels_do_not_overlap():
@@ -259,17 +261,22 @@ def test_the_two_pooling_kernels_do_not_overlap():
 
     A caller who asks the wrong one must be routed, not merely rejected.
     """
-    halve = resolve("maxpool2d", shape=(2, 8, 8), kernel_size=2, stride=2, padding=0)
-    assert halve.app_name == "maxpool2d_halve"
-    assert halve.alternatives == (), halve.alternatives
+    stride2 = resolve("maxpool2d", shape=(2, 8, 8), kernel_size=2, stride=2, padding=0)
+    assert stride2.app_name == "maxpool2d_stride2"
+    assert stride2.alternatives == (), halve.alternatives
 
     window = resolve("maxpool2d", shape=(2, 8, 8), kernel_size=3, stride=1, padding=1)
     assert window.app_name == "maxpool2d_window"
     assert window.alternatives == (), window.alternatives
 
+    # K=9 is the one window where a second kernel also claims it, on purpose.
+    nms = resolve("maxpool2d", shape=(2, 60, 80), kernel_size=9, stride=1, padding=4)
+    assert nms.app_name == "maxpool2d_nms9"
+    assert nms.alternatives == ("maxpool2d_window",), nms.alternatives
+
     stride_2 = SPEC.check(**_params(kernel_size=2, stride=2, padding=0))
     assert not stride_2.ok
-    assert "maxpool2d_halve" in stride_2.reason, stride_2.reason
+    assert "maxpool2d_stride2" in stride_2.reason, stride_2.reason
 
 
 def test_wide_window_lane_cost_is_disclosed():
@@ -308,9 +315,13 @@ def test_a_full_resolution_nms_map_fits_in_one_launch():
         "maxpool2d", shape=(1, 480, 640), kernel_size=9, stride=1, padding=4
     )
     assert verdict.supported, verdict.reason
-    assert verdict.app_name == "maxpool2d_window"
+    # The unrolled maxpool2d_nms9 wins K=9 on cost; this kernel still claims it
+    # (its supports states the true domain) and its layout is what is checked.
+    assert verdict.app_name == "maxpool2d_nms9"
+    assert "maxpool2d_window" in verdict.alternatives, verdict.alternatives
     app = MaxPool2dWindowApp(
-        inst_path="unused.bin", input_path="unused.bin", **verdict.kwargs
+        inst_path="unused.bin", input_path="unused.bin",
+        channels=1, height=480, width=640, kernel_size=9,
     )
     assert app.geometry.total_rows == 64 + 488 * 6 + 1 + 480 * 6
 

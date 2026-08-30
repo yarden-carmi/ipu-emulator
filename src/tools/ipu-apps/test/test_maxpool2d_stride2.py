@@ -10,12 +10,12 @@ import pytest
 
 from ipu_as.lark_tree import assemble_to_bin_file
 from ipu_apps.kernel_registry import MalformedQuery, resolve
-from ipu_apps.pooling.maxpool2d_halve import SPEC, MaxPool2dHalveApp
+from ipu_apps.pooling.maxpool2d_stride2 import SPEC, MaxPool2dStride2App
 
 ASM_PATH = (
     Path(__file__).resolve().parents[1]
-    / "src/ipu_apps/pooling/maxpool2d_halve"
-    / "maxpool2d_halve.asm"
+    / "src/ipu_apps/pooling/maxpool2d_stride2"
+    / "maxpool2d_stride2.asm"
 )
 
 
@@ -53,7 +53,7 @@ def _naive_reference(x: np.ndarray) -> np.ndarray:
 @pytest.fixture(scope="module")
 def inst_file():
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "maxpool2d_halve.bin"
+        path = Path(tmp) / "maxpool2d_stride2.bin"
         assemble_to_bin_file(ASM_PATH.read_text(), str(path))
         yield path
 
@@ -62,7 +62,7 @@ def _run(inst_file, tmp_path, x: np.ndarray) -> np.ndarray:
     c, h, w = x.shape
     xp, op = tmp_path / "x.bin", tmp_path / "y.bin"
     x.astype("<f4").tofile(xp)
-    app = MaxPool2dHalveApp(
+    app = MaxPool2dStride2App(
         inst_path=inst_file,
         input_path=xp,
         output_path=op,
@@ -168,7 +168,7 @@ def test_padding_lanes_do_not_leak(inst_file, tmp_path):
     xp, op = tmp_path / "x.bin", tmp_path / "y.bin"
     x.astype("<f4").tofile(xp)
 
-    app = MaxPool2dHalveApp(
+    app = MaxPool2dStride2App(
         inst_path=inst_file, input_path=xp, output_path=op,
         channels=c, height=h, width=w,
     )
@@ -195,7 +195,7 @@ def test_output_file_layout_is_dense(inst_file, tmp_path):
     x = rng.standard_normal((c, h, w), dtype=np.float32)
     xp, op = tmp_path / "x.bin", tmp_path / "y.bin"
     x.astype("<f4").tofile(xp)
-    app = MaxPool2dHalveApp(
+    app = MaxPool2dStride2App(
         inst_path=inst_file, input_path=xp, output_path=op,
         channels=c, height=h, width=w,
     )
@@ -207,7 +207,7 @@ def test_output_file_layout_is_dense(inst_file, tmp_path):
 
 def test_tile_geometry_is_what_the_kernel_assumes():
     """128 output columns per row, two input tiles each, plus one guard tile."""
-    app = MaxPool2dHalveApp(
+    app = MaxPool2dStride2App(
         inst_path="unused.bin", input_path="unused.bin",
         channels=1, height=4, width=300,
     )
@@ -238,7 +238,7 @@ def test_registry_resolves_to_this_kernel(inst_file, tmp_path):
     c, h, w = 4, 6, 40
     verdict = resolve("maxpool2d", shape=(c, h, w), kernel_size=2, stride=2, padding=0)
     assert verdict.supported, verdict.reason
-    assert verdict.app_name == "maxpool2d_halve"
+    assert verdict.app_name == "maxpool2d_stride2"
     assert verdict.shapes["output"] == (c, h // 2, w // 2)
 
     rng = np.random.default_rng(17)
@@ -295,7 +295,7 @@ def test_constructor_guard_matches_spec(overrides, ctor):
     assert not resolve("maxpool2d", **params).supported
 
     with pytest.raises(ValueError):
-        MaxPool2dHalveApp(inst_path="unused.bin", input_path="unused.bin", **ctor)
+        MaxPool2dStride2App(inst_path="unused.bin", input_path="unused.bin", **ctor)
 
 
 def test_over_budget_refusal_says_how_to_tile():

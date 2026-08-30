@@ -339,7 +339,7 @@ def _supports(**params):
         return no(
             f"pools with stride {STRIDE}; this query asks for stride {q.stride}. "
             f"A stride-2 pool decimates its result and has its own kernel "
-            f"(maxpool2d_halve)."
+            f"(maxpool2d_stride2)."
         )
     if q.kernel % 2 == 0:
         return no(
@@ -414,7 +414,10 @@ SPEC = KernelSpec(
     explain=_explain,
     caveats=_caveats,
     bundle=lambda **params: _query(params).bundle,
-    # Disjoint from maxpool2d_halve -- that kernel is stride 2, this one stride
-    # 1 -- so cost never actually decides between them.
-    cost=lambda **params: 0.0,
+    # Disjoint from maxpool2d_stride2 -- that kernel is stride 2, this one
+    # stride 1 -- so cost never decides between those two. It does decide
+    # against maxpool2d_nms9, which handles K=9 alone and about 24% faster:
+    # this kernel genuinely handles K=9 as well (its `supports` must say so),
+    # and steps aside on cost.
+    cost=lambda **params: 1.0,
 )

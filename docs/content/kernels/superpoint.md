@@ -14,13 +14,13 @@ All kernels here run in **wide-vector FP32 debug mode**
 |---|---|---|
 | 1 | `conv1a`–`conv4b` (8× 3×3 + ReLU) | [`conv3x3_relu`](conv2d.md) |
 | 2 | ReLU | fused into the store (`ACTIVATE.QUANTIZE relu`) |
-| 3 | `MaxPool2d(2, 2)` ×3 | [`maxpool2d_halve`](pooling.md) |
+| 3 | `MaxPool2d(2, 2)` ×3 | [`maxpool2d_stride2`](pooling.md) |
 | 4 | `convPa` (3×3 + ReLU) | [`conv3x3_relu`](conv2d.md) |
 | 5 | `convPb` (1×1 → 65) | [`conv1x1`](conv2d.md) |
 | 6 | detector softmax over 65 channels | [`softmax_columns`](softmax.md) |
 | 7 | drop the dustbin channel | a slice — host data movement |
 | 8 | depth-to-space (pixel shuffle, r = 8) | [`depth_to_space`](reshape.md) |
-| 9 | `simple_nms` pooling (9×9, stride 1) | [`maxpool2d_window`](pooling.md) |
+| 9 | `simple_nms` pooling (9×9, stride 1) | [`maxpool2d_nms9`](pooling.md) |
 | 10 | score threshold | [`score_threshold`](detect.md) |
 | 11 | border removal | a data-independent mask — host |
 | 12 | top-k cap | [`score_threshold`](detect.md)'s soft count + a host bisection |
@@ -82,8 +82,8 @@ Wide-vector XMEM holds 16384 rows of 512 B. At full 480×640 resolution:
 | Operation | Fits in one launch? |
 |---|---|
 | every convolution | **no** — must be tiled into row bands |
-| `maxpool2d_halve` on a 64-channel map | **no** — must be banded |
-| `maxpool2d_window` on the single-plane score map | **yes** — 2928 + 2880 rows |
+| `maxpool2d_stride2` on a 64-channel map | **no** — must be banded |
+| `maxpool2d_nms9` on the single-plane score map | **yes** — 2928 + 2880 rows |
 | `depth_to_space` (60×80×64 → 480×640) | **yes** — 3840 + 3840 rows |
 | `score_threshold` on the 480×640 map | **yes** |
 

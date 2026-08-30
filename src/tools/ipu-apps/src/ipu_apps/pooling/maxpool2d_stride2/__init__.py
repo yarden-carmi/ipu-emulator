@@ -56,10 +56,10 @@ the discarded lanes finite and debuggable rather than about correctness.
 
 Usage::
 
-    from ipu_apps.pooling.maxpool2d_halve import MaxPool2dHalveApp
+    from ipu_apps.pooling.maxpool2d_stride2 import MaxPool2dStride2App
 
-    app = MaxPool2dHalveApp(
-        inst_path="maxpool2d_halve.bin",
+    app = MaxPool2dStride2App(
+        inst_path="maxpool2d_stride2.bin",
         input_path="x.bin",       # C*H*W FP32, channel-major
         output_path="y.bin",      # C*(H//2)*(W//2) FP32
         channels=64, height=8, width=80,
@@ -112,7 +112,7 @@ PAD_ROWS = 0
 SCRATCH_ROWS = 2
 
 
-class MaxPool2dHalveApp(IpuApp):
+class MaxPool2dStride2App(IpuApp):
     """2x2 stride-2 max-pool over a ``(C, H, W)`` activation.
 
     Args:
@@ -360,11 +360,11 @@ def _caveats(**params):
 
 
 SPEC = KernelSpec(
-    name="maxpool2d_halve",
+    name="maxpool2d_stride2",
     op="maxpool2d",
-    variant="halve",
-    app_class=MaxPool2dHalveApp,
-    asm="maxpool2d_halve.asm",
+    variant="stride2",
+    app_class=MaxPool2dStride2App,
+    asm="maxpool2d_stride2.asm",
     # The window parameters are required rather than defaulted on purpose: a
     # pooling spec that silently assumed stride 2 would answer for an operation
     # no kernel here computes.

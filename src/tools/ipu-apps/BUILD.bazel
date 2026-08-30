@@ -196,10 +196,10 @@ py_pytest_test(
 # the app .asm is provided as data; no pre-assembled .bin target is needed.
 
 py_pytest_test(
-    name = "test_maxpool2d_halve",
-    srcs = ["test/test_maxpool2d_halve.py"],
+    name = "test_maxpool2d_stride2",
+    srcs = ["test/test_maxpool2d_stride2.py"],
     data = [
-        "src/ipu_apps/pooling/maxpool2d_halve/maxpool2d_halve.asm",
+        "src/ipu_apps/pooling/maxpool2d_stride2/maxpool2d_stride2.asm",
     ],
     imports = ["src"],
     deps = [
@@ -289,6 +289,21 @@ py_pytest_test(
         "src/ipu_apps/detect/channel_peak/channel_peak.asm",
         "src/ipu_apps/softmax/softmax_columns/softmax_columns.asm",
         "src/ipu_apps/softmax/softmax_columns_packed/softmax_columns_packed.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
+py_pytest_test(
+    name = "test_maxpool2d_unrolled_nms",
+    srcs = ["test/test_maxpool2d_unrolled_nms.py"],
+    data = [
+        "src/ipu_apps/pooling/maxpool2d_nms7/maxpool2d_nms7.asm",
+        "src/ipu_apps/pooling/maxpool2d_nms9/maxpool2d_nms9.asm",
+        "src/ipu_apps/pooling/maxpool2d_window/maxpool2d_window.asm",
     ],
     imports = ["src"],
     deps = [
