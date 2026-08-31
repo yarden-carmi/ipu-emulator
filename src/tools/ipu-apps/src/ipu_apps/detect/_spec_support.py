@@ -166,9 +166,7 @@ def threshold_refusal(q: ThresholdQuery) -> str | None:
             f"needs {q.total_rows} XMEM rows (scores {q.rows} + selected "
             f"{q.rows} + staged sigmoid {q.rows} + 4 resident + {BASE_ROW} "
             f"reserved); wide-vector XMEM holds {XMEM_ROWS} rows of "
-            f"{ROW_BYTES} B. Split the map into chunks of at most "
-            f"{q.max_elements} elements; the gate is element-wise, so a chunk "
-            f"needs no context, and the counts add."
+            f"{ROW_BYTES} B."
         )
     return None
 
@@ -207,14 +205,6 @@ class PeakQuery:
     def total_rows(self) -> int:
         # input + confidence + keep + one resident tau row.
         return BASE_ROW + self.input_rows + 2 * self.tiles + 1
-
-    @property
-    def max_channels(self) -> int:
-        """Largest channel count that would fit the budget at this cell count."""
-        if self.tiles < 1:
-            return 0
-        return max(0, (XMEM_ROWS - BASE_ROW - 1 - 2 * self.tiles) // self.tiles)
-
 
 def peak_query(shape, *, threshold) -> PeakQuery:
     """Normalise a channel_peak query.
@@ -261,18 +251,11 @@ def peak_refusal(q: PeakQuery) -> str | None:
     if q.cells < 1:
         return f"cells ({q.cells}) must be >= 1"
     if q.total_rows > XMEM_ROWS:
-        band = q.max_channels
-        advice = (
-            f"Reduce at most {band} channels per launch and combine the "
-            f"partial maxima on the host, or split the cells."
-            if band >= 1
-            else "Even one channel plane does not fit; split the cells."
-        )
         return (
             f"needs {q.total_rows} XMEM rows (input {q.input_rows} + "
             f"confidence {q.tiles} + keep {q.tiles} + 1 resident + {BASE_ROW} "
             f"reserved); wide-vector XMEM holds {XMEM_ROWS} rows of "
-            f"{ROW_BYTES} B. {advice}"
+            f"{ROW_BYTES} B."
         )
     return None
 

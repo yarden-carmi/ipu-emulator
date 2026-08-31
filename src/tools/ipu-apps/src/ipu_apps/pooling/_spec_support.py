@@ -156,35 +156,6 @@ class PoolLayout:
             BASE_ROW + self.input_rows + self.scratch_rows + self.output_rows
         )
 
-    @property
-    def max_band_height(self) -> int:
-        """Largest input ``height`` that would fit the budget at this width.
-
-        Reported in the over-budget refusal so the caller learns how to tile
-        rather than only that it failed. Zero when even one output row
-        overflows.
-
-        Costed per *output* row, not per input row: banding the input bands the
-        output too, so charging the full output region against a shortened
-        input would make almost every real layer look untileable. One output row
-        consumes ``stride`` input rows, and the vertical border is paid once per
-        band regardless of its height.
-        """
-        q = self.query
-        per_out_row = q.channels * (
-            q.stride * self.in_tiles_per_row + self.out_tiles_per_row
-        )
-        if per_out_row < 1:
-            return 0
-        border = q.channels * 2 * self.pad_rows * self.in_tiles_per_row
-        fixed = BASE_ROW + self.scratch_rows + border
-        out_rows = (XMEM_ROWS - fixed) // per_out_row
-        if out_rows < 1:
-            return 0
-        # Inverse of out_height = (h + 2*pad - k) // stride + 1, taking the
-        # smallest h that yields `out_rows` so the answer is never optimistic.
-        return (out_rows - 1) * q.stride + q.kernel - 2 * self.pad_rows
-
 
 @dataclass(frozen=True)
 class PoolQuery:
@@ -346,20 +317,21 @@ def geometry_refusal(q: PoolQuery) -> str | None:
 
 
 def xmem_refusal(layout: PoolLayout) -> str | None:
-    """Refuse a query whose regions do not fit the wide-vector XMEM budget."""
+    """Refuse a query whose regions do not fit the wide-vector XMEM budget.
+
+    A backstop, not a routine limit. XMEM is sized so every layer runs in one
+    launch; this exists so a shape that genuinely cannot fit is refused with the
+    arithmetic rather than crashing inside a store instruction thousands of
+    cycles in. There is no row-band tiling to fall back on -- the kernels
+    process whatever extent they are given, in one launch.
+    """
     if layout.total_rows <= XMEM_ROWS:
         return None
-    band = layout.max_band_height
-    advice = (
-        f"Tile the input into row bands of at most {band} rows."
-        if band >= 1
-        else "Even a single row does not fit; reduce the channel count or width."
-    )
     return (
         f"needs {layout.total_rows} XMEM rows (input {layout.input_rows} + "
         f"output {layout.output_rows} + scratch {layout.scratch_rows} + "
         f"{BASE_ROW} reserved); wide-vector XMEM holds {XMEM_ROWS} rows of "
-        f"{ROW_BYTES} B. {advice}"
+        f"{ROW_BYTES} B."
     )
 
 

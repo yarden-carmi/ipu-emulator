@@ -90,20 +90,6 @@ class NormQuery:
         """Every row a kernel touches: input + one scale vector + output."""
         return BASE_ROW + 2 * self.region_rows + 1
 
-    @property
-    def max_band_rows(self) -> int:
-        """Largest ``rows`` that would fit the budget at this width.
-
-        Reported in the over-budget refusal so the caller learns how to tile.
-        Note this bands the *reduction* axis, which an L2 norm cannot simply be
-        run over independently -- see :func:`xmem_refusal`.
-        """
-        per_row = 2 * self.tiles_per_channel
-        if per_row < 1:
-            return 0
-        return max(0, (XMEM_ROWS - BASE_ROW - 1) // per_row)
-
-
 def norm_query(shape, dim: int) -> NormQuery:
     """Normalise ``(shape, dim)`` into the form every l2_normalize kernel routes on.
 
@@ -180,25 +166,18 @@ def geometry_refusal(q: NormQuery) -> str | None:
 def xmem_refusal(q: NormQuery) -> str | None:
     """Refuse a query whose regions do not fit the wide-vector XMEM budget.
 
-    The advice deliberately points at the *column* axis, not the reduction
-    axis. Splitting the reduction would give each band its own partial sum of
-    squares, which is not a normalization of anything -- the columns are the
-    independent problems, so they are what may be tiled.
+    A backstop, not a routine limit. XMEM is sized so every layer runs in one
+    launch; this exists so a shape that genuinely cannot fit is refused with the
+    arithmetic rather than crashing inside a store instruction thousands of
+    cycles in. There is no row-band tiling to fall back on -- the kernels
+    process whatever extent they are given, in one launch.
     """
     if q.total_rows <= XMEM_ROWS:
         return None
-    fits = max(0, (XMEM_ROWS - BASE_ROW - 1) // (2 * q.rows)) * LANES
-    advice = (
-        f"Split the {q.cols} independent columns into chunks of at most "
-        f"{fits}; the {q.rows}-element reduction axis cannot be split, because "
-        f"a partial sum of squares does not normalize anything."
-        if fits >= 1
-        else "Even one column tile does not fit; reduce the reduction length."
-    )
     return (
         f"needs {q.total_rows} XMEM rows (input {q.region_rows} + output "
         f"{q.region_rows} + 1 scale row + {BASE_ROW} reserved); wide-vector "
-        f"XMEM holds {XMEM_ROWS} rows of {ROW_BYTES} B. {advice}"
+        f"XMEM holds {XMEM_ROWS} rows of {ROW_BYTES} B."
     )
 
 

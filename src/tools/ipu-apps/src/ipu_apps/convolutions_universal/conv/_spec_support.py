@@ -160,20 +160,6 @@ class ConvLayout:
             + self.output_rows
         )
 
-    @property
-    def max_band_height(self) -> int:
-        """Largest ``height`` that would fit the budget at this width/channels.
-
-        Reported in the over-budget refusal so the caller learns how to tile
-        rather than only that it failed. Zero when even a single row overflows.
-        """
-        per_row = self.tiles_per_row * ((self.query.cin + 1) + self.query.cout)
-        if per_row < 1:
-            return 0
-        border = (self.query.cin + 1) * 2 * self.pad_rows * self.tiles_per_row
-        fixed = BASE_ROW + self.weight_rows + self.bias_rows + border
-        return max(0, (XMEM_ROWS - fixed) // per_row)
-
 
 @dataclass(frozen=True)
 class ConvQuery:
@@ -396,21 +382,21 @@ def activation_refusal(q: ConvQuery, implemented: str) -> str | None:
 
 
 def xmem_refusal(layout: ConvLayout) -> str | None:
-    """Refuse a query whose regions do not fit the wide-vector XMEM budget."""
+    """Refuse a query whose regions do not fit the wide-vector XMEM budget.
+
+    A backstop, not a routine limit. XMEM is sized so every SuperPoint layer
+    runs in one launch; this exists so a shape that genuinely cannot fit is
+    refused with the arithmetic rather than crashing inside a store instruction
+    thousands of cycles in. There is no row-band tiling to fall back on -- the
+    kernels process whatever height they are given, in one launch.
+    """
     if layout.total_rows <= XMEM_ROWS:
         return None
-    band = layout.max_band_height
-    advice = (
-        f"Tile the input into row bands of at most {band} rows."
-        if band >= 1
-        else "Even a single row does not fit; reduce the channel count or width."
-    )
     return (
         f"needs {layout.total_rows} XMEM rows (input {layout.input_rows} incl. "
         f"1 guard plane + weights {layout.weight_rows} + bias "
         f"{layout.bias_rows} + output {layout.output_rows} + {BASE_ROW} "
-        f"reserved); wide-vector XMEM holds {XMEM_ROWS} rows of {ROW_BYTES} B. "
-        f"{advice}"
+        f"reserved); wide-vector XMEM holds {XMEM_ROWS} rows of {ROW_BYTES} B."
     )
 
 

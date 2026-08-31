@@ -190,6 +190,20 @@ py_pytest_test(
     ],
 )
 
+py_pytest_test(
+    name = "test_conv3x3_relu_cin1",
+    srcs = ["test/test_conv3x3_relu_cin1.py"],
+    data = [
+        "src/ipu_apps/convolutions_universal/conv/conv3x3_relu/conv3x3_relu.asm",
+        "src/ipu_apps/convolutions_universal/conv/conv3x3_relu_cin1/conv3x3_relu_cin1.asm",
+    ],
+    imports = ["src"],
+    deps = [
+        ":ipu_apps_lib",
+        requirement("pytest"),
+    ],
+)
+
 # -- pooling apps (FP32 wide-vector) ---------------------------------------
 #
 # Assembles the .asm in-process (assemble_to_bin_file in the test fixture), so

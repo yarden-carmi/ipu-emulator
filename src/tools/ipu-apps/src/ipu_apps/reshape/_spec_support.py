@@ -112,17 +112,6 @@ class ShuffleQuery:
     def total_rows(self) -> int:
         return BASE_ROW + self.input_rows + self.output_rows
 
-    @property
-    def max_band_height(self) -> int:
-        """Largest input ``height`` that would fit the budget at this width."""
-        per_row = self.channels * self.in_tiles_per_row + (
-            self.out_channels * self.r * self.out_tiles_per_row
-        )
-        if per_row < 1:
-            return 0
-        return max(0, (XMEM_ROWS - BASE_ROW) // per_row)
-
-
 def shuffle_query(shape, *, upscale_factor) -> ShuffleQuery:
     """Normalise a depth_to_space query into the form the kernel routes on.
 
@@ -195,20 +184,20 @@ def geometry_refusal(q: ShuffleQuery) -> str | None:
 
 
 def xmem_refusal(q: ShuffleQuery) -> str | None:
-    """Refuse a query whose regions do not fit the wide-vector XMEM budget."""
+    """Refuse a query whose regions do not fit the wide-vector XMEM budget.
+
+    A backstop, not a routine limit. XMEM is sized so every layer runs in one
+    launch; this exists so a shape that genuinely cannot fit is refused with the
+    arithmetic rather than crashing inside a store instruction thousands of
+    cycles in. There is no row-band tiling to fall back on -- the kernels
+    process whatever extent they are given, in one launch.
+    """
     if q.total_rows <= XMEM_ROWS:
         return None
-    band = q.max_band_height
-    advice = (
-        f"Tile the input into row bands of at most {band} rows; the shuffle is "
-        f"independent across input rows, so a band needs no halo."
-        if band >= 1
-        else "Even a single row does not fit; reduce the channel count or width."
-    )
     return (
         f"needs {q.total_rows} XMEM rows (input {q.input_rows} + output "
         f"{q.output_rows} + {BASE_ROW} reserved); wide-vector XMEM holds "
-        f"{XMEM_ROWS} rows of {ROW_BYTES} B. {advice}"
+        f"{XMEM_ROWS} rows of {ROW_BYTES} B."
     )
 
 

@@ -11,7 +11,7 @@ not here — this class has no notion of "mode".
 
 from __future__ import annotations
 
-XMEM_SIZE_BYTES = 1 << 23        # 8 MB
+XMEM_SIZE_BYTES = 1 << 30        # 1 GB
 XMEM_WIDTH_BYTES = 128           # one "word" = 128 bytes
 XMEM_DEPTH_WORDS = XMEM_SIZE_BYTES // XMEM_WIDTH_BYTES
 

@@ -447,6 +447,8 @@ SPEC = KernelSpec(
     explain=_explain,
     caveats=_caveats,
     bundle=lambda **params: _query(params).bundle,
-    # The only 3x3 conv2d kernel, and an exact match for its domain.
-    cost=lambda **params: 0.0,
+    # The general 3x3 kernel. It genuinely handles Cin=1 too and must say so,
+    # but conv3x3_relu_cin1 unrolls the channel loop away and is 1.77x faster
+    # there, so this steps aside on cost.
+    cost=lambda **params: 1.0,
 )
