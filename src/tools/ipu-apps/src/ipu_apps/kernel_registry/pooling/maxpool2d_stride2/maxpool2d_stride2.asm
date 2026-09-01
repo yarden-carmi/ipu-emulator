@@ -12,9 +12,10 @@
       and cannot shift by one element. MULT.RC.* instead reads R_CYCLIC at an
       arbitrary ELEMENT index and may cross slot boundaries, so the horizontal
       shift happens inside the register: the two vertically-neighbouring rows
-      occupy R_CYCLIC slots 0/1 and 2/3, and dx becomes a +1 step on the read
-      index. `MULT.RC.VE rc, cr1` is the identity move (R_CYCLIC x 1.0), so a
-      tap is one MULT plus one ACC.MAX.
+      occupy R_CYCLIC slots 0 and 2, and dx becomes a +1 step on the read index.
+      `MULT.RC.VE rc, cr1` is the identity move (R_CYCLIC x 1.0), so a tap is one
+      MULT plus one ACC.MAX. The +1 read's final temporary position enters the
+      unused next slot, but ACC.STRIDE always discards that position.
 
       ACC.MAX.FIRST seeds R_ACC from the first tap, so no -inf seed vector is
       needed and nothing carries over from the previous tile.
@@ -31,7 +32,7 @@
 
       `ACC.STRIDE 64 on off` reads MULT_RES as two rows of 64, takes every
       second element of each, and writes the 64 survivors CONTIGUOUSLY at
-      R_ACC[(offset % 4) * 32]. That is exactly lanes 0,2,...,126 packed down
+      R_ACC[(offset % 4) * 32]. That is exactly positions 0,2,...,126 packed down
       to 64 -- the even columns, which are the stride-2 outputs.
 
       BOTH HALVES ARE STAGED BEFORE EITHER ACC.STRIDE. Half B's ACC.MAX.FIRST
@@ -39,46 +40,42 @@
       half A had already been decimated into R_ACC[0:64]. Staging both, then
       decimating both, works because ACC.STRIDE leaves the R_ACC indices it does
       NOT write untouched: half A lands at base 0 (offset 0) and half B at base
-      64 (offset 2), filling one 128-lane output row between them.
+      64 (offset 2), filling one 128-element output XMEM row between them.
 
     TILING:
       One output XMEM row is 128 output columns, so it spans 256 input columns
       = two full-width input tiles ("halves"). Output tile ot reads input tiles
       2*ot (half A) and 2*ot+1 (half B).
 
-      Each spatial row carries ONE GUARD TILE past the tiles the halves read,
-      filled with -FLT_MAX. It exists because the dx=1 tap reads element 128 of
-      its slot pair, i.e. the first element of the NEXT tile of the SAME spatial
-      row -- so both slots of a pair are loaded, and the last half of the last
-      output tile still needs a tile after it. -FLT_MAX can never win a maximum,
-      so the guard is inert.
+      This full-pair variant is selected only when both input tiles exist for
+      every output XMEM row. The separate tail variant handles a final output
+      XMEM row backed by only one input XMEM row. Both variants use exactly
+      ceil(W/128) input XMEM rows per matrix row, with no guard row.
 
-      Columns past W inside a partly-filled tile are likewise -FLT_MAX. They
-      never reach a kept output lane (output lane j < W//2 reads input columns
-      2j and 2j+1, both < W), but filling them with the maximum's identity keeps
-      the discarded lanes finite and debuggable rather than garbage.
+      Positions past W inside the final partly-filled XMEM row are -FLT_MAX.
+      They never reach a kept output position: output element j < W//2 reads
+      input elements 2j and 2j+1, both < W.
 
       NO VERTICAL BORDER: padding is 0, so rows 2y and 2y+1 are always real
       image rows and there is no top/bottom special case. An odd H or W simply
       drops the last row/column, which is what nn.MaxPool2d(2, 2) does.
 
     R_CYCLIC SLOTS (per half):
-      slot 0 (idx   0) <- spatial row 2y,   tile it
-      slot 1 (idx 128) <- spatial row 2y,   tile it+1     (supplies element 128)
-      slot 2 (idx 256) <- spatial row 2y+1, tile it
-      slot 3 (idx 384) <- spatial row 2y+1, tile it+1     (supplies element 384)
+      slot 0 (idx   0) <- spatial row 2y,   current input XMEM row
+      slot 2 (idx 256) <- spatial row 2y+1, current input XMEM row
 
       Taps read rc = 0, 1, 256, 257. LDR_CYCLIC_MULT_REG's index is restricted
       to slot boundaries {0,128,256,384}; MULT.RC.VE's rc_idx is not, which is
-      what rc=1 and rc=257 rely on. R_CYCLIC contents are read from the
-      start-of-word SNAPSHOT, so every load lands at least one word before the
-      multiply that consumes it.
+      what rc=1 and rc=257 rely on. Their final temporary positions enter the
+      unused slots 1/3 and are discarded by ACC.STRIDE. R_CYCLIC contents are
+      read from the start-of-word SNAPSHOT, so every load lands at least one
+      word before the multiply that consumes it.
 
-    CR map (set by the harness; CR0/CR1 are READ-ONLY hardware constants):
-      CR0  = 0                        CR1  = 1  (-> 1.0 scalar; every +1)
+    CR map (set by the harness; {{zero}}/{{one}}are READ-ONLY hardware constants):
+      CR0  = 0                        CR1 = 1  (-> 1.0 scalar; every +1)
       CR2  = INPUT_BASE   (rows)      CR3  = OUTPUT_BASE  (rows)
       CR4  = SCRATCH_BASE (rows; 2 rows)
-      CR5  = IN_ROW_STRIDE   -- input XMEM rows per spatial row, guard included
+      CR5  = IN_ROW_STRIDE = ceil(W/128) XMEM rows per spatial row
       CR6  = 2 * IN_ROW_STRIDE -- advance from spatial row 2y to 2(y+1)
       CR7  = OUT_TILES_PER_ROW        CR8  = OUT_HEIGHT = H // 2
       CR9  = CHANNELS                 CR10 = 128
@@ -102,85 +99,113 @@
 {%- set lr_addr  = "lr7"  -%}  {#- walking input row address -#}
 {%- set lr_s1    = "lr8"  -%}  {#- 128: R_CYCLIC slot-1 index -#}
 {%- set lr_s2    = "lr9"  -%}  {#- 256: R_CYCLIC slot-2 index AND tap (1,0) -#}
-{%- set lr_s3    = "lr10" -%}  {#- 384: R_CYCLIC slot-3 index -#}
+{%- set lr_baddr = "lr10" -%}  {#- walking input address for spatial row 2y+1 -#}
 {%- set lr_one   = "lr11" -%}  {#- 1: tap (0,1) AND scratch row B offset -#}
 {%- set lr_s2p1  = "lr12" -%}  {#- 257: tap (1,1) -#}
 {%- set lr_half  = "lr13" -%}  {#- 2: ACC.STRIDE offset selecting R_ACC base 64 -#}
 {%- set lr_itile = "lr14" -%}  {#- address of (spatial row 2*oy, input tile 2*ot) -#}
 
-    SET {{lr_zero}} cr0 ;
-    SET {{lr_c}}    cr0 ;
-    SET {{lr_out}}  cr0 ;;
-    SET {{lr_cbase}} cr0 ;
-    SET {{lr_s1}}    cr10 ;
-    SET {{lr_one}}   cr1 ;;                              {#- 0, 128, 1 -#}
-    ADD {{lr_s2}} {{lr_s1}} {{lr_s1}} ;;                 {#- 256 (snapshot: lr_s1 set last word) -#}
-    ADD {{lr_s3}} {{lr_s2}} {{lr_s1}} ;
-    ADD {{lr_s2p1}} {{lr_s2}} cr1 ;
-    ADD {{lr_half}} {{lr_one}} cr1 ;;                    {#- 384, 257, 2 -#}
+{%- set zero  = "cr0"  -%}
+{%- set one  = "cr1"  -%}
+{%- set input_base_address  = "cr2"  -%}
+{%- set xmem_row_stride  = "cr5"  -%} #how many xmem rows needed for one matrix row 
+{%- set cyclic_slot_1  = "cr10"  -%} #cr10 = 128
+{%- set dstructure  = "cr15"  -%} 
+
+
+
+    SET {{lr_zero}} {{zero}} ;#lr_zero = 0
+    SET {{lr_s1}} {{cyclic_slot_1}} ;#lr_s1 = 128
+    SET {{lr_out}} {{zero}} ;;#lr_out = 0
+    
+    SET {{lr_cbase}} {{zero}} ;#lr_cbase = 0
+    SET {{lr_one}} {{one}} ;#lr_one = 1                      
+    ADD {{lr_s2}} {{lr_s1}} {{lr_s1}} ;;#lr_s2 = 256          
+
+    SET {{lr_c}} {{zero}} ;#lr_c = 0
+    ADD {{lr_s2p1}} {{lr_s2}} {{one}};#lr_s2p1 = 257
+    ADD {{lr_half}} {{lr_one}} {{one}};;#lr_half = 2
 
 chan_loop:
-    SET {{lr_oy}} cr0 ;
-    ADD {{lr_rowb}} {{lr_cbase}} cr0 ;;                  {#- rowb = this channel's plane base -#}
+    SET {{lr_oy}} {{zero}} ; #lr_oy = 0 
+    ADD {{lr_rowb}} {{lr_cbase}} {{zero}} ;;#lr_rowb = lr_cbase
 
 row_loop:
-    SET {{lr_ot}} cr0 ;
-    ADD {{lr_itile}} {{lr_rowb}} cr0 ;;                  {#- input tile 0 of spatial row 2*oy -#}
+    SET {{lr_ot}} {{zero}} ;#lr_ot = 0
+    ADD {{lr_itile}} {{lr_rowb}} {{zero}} ;;#lr_itile = lr_rowb
 
 tile_loop:
-{#- ---- HALF A: input tiles 2*ot and 2*ot+1 -------------------------------- -#}
-    ADD {{lr_addr}} {{lr_itile}} cr0 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_zero}} ;;   {#- slot0 <- row 2y,   tile it -#}
-    INC {{lr_addr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s1}} ;;     {#- slot1 <- row 2y,   tile it+1 -#}
-    ADD {{lr_addr}} {{lr_itile}} cr5 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s2}} ;;     {#- slot2 <- row 2y+1, tile it -#}
-    INC {{lr_addr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s3}} ;;     {#- slot3 <- row 2y+1, tile it+1 -#}
-    MULT.RC.VE {{lr_zero}}  cr1 0 {{lr_zero}} cr15 ; ACC.MAX.FIRST ;;   {#- dy 0 dx 0 -#}
-    MULT.RC.VE {{lr_one}}   cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;;         {#- dy 0 dx 1 -#}
-    MULT.RC.VE {{lr_s2}}    cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;;         {#- dy 1 dx 0 -#}
-    MULT.RC.VE {{lr_s2p1}}  cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;
-    ACTIVATE.QUANTIZE identity cr15 ;
+{#- ---- HALF A: input tile 2*ot --------------------------------------------- -#}
+    ADD {{lr_addr}} {{lr_itile}} {{zero}} ; #lr_addr = lr_itile
+    ADD {{lr_baddr}} {{lr_itile}} {{xmem_row_stride}};#lr_baddr = lr_itile + xmem_row_stride
+    LDR_CYCLIC_MULT_REG {{lr_addr}} {{input_base_address}} {{lr_zero}} ;;#R_CYCLIC[0...127] = Memory[row(input_base_address + lr_addr)]
+
+    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{input_base_address}} {{lr_s2}} ;;#R_CYCLIC[256...511] = Memory[row(input_base_address + lr_baddr)]
+
+    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX.FIRST ;;   {#- dy 0 dx 0 -#}
+
+    MULT.RC.VE {{lr_one}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;;         {#- dy 0 dx 1 -#}
+
+    MULT.RC.VE {{lr_s2}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;;         {#- dy 1 dx 0 -#}
+
+    MULT.RC.VE {{lr_s2p1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;
+    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
     STR_POST_AAQ_REG {{lr_zero}} cr4 ;;                  {#- dy 1 dx 1 | stage half A -#}
 
-{#- ---- HALF B: input tiles 2*ot+1 and 2*ot+2 ------------------------------ -#}
-    ADD {{lr_addr}} {{lr_itile}} cr1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_zero}} ;;   {#- slot0 <- row 2y,   tile it+1 -#}
-    INC {{lr_addr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s1}} ;;     {#- slot1 <- row 2y,   tile it+2 -#}
-    ADD {{lr_addr}} {{lr_itile}} cr5 ;;                  {#- row 2y+1, tile it -#}
-    INC {{lr_addr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s2}} ;;     {#- slot2 <- row 2y+1, tile it+1 -#}
-    INC {{lr_addr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_addr}} cr2 {{lr_s3}} ;;     {#- slot3 <- row 2y+1, tile it+2 -#}
-    MULT.RC.VE {{lr_zero}}  cr1 0 {{lr_zero}} cr15 ; ACC.MAX.FIRST ;;
-    MULT.RC.VE {{lr_one}}   cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;;
-    MULT.RC.VE {{lr_s2}}    cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;;
-    MULT.RC.VE {{lr_s2p1}}  cr1 0 {{lr_zero}} cr15 ; ACC.MAX ;
-    ACTIVATE.QUANTIZE identity cr15 ;
+{#- ---- HALF B: input tile 2*ot+1 ------------------------------------------- -#}
+    ADD {{lr_addr}} {{lr_itile}} {{one}};
+    ADD {{lr_baddr}} {{lr_itile}} {{xmem_row_stride}};
+    LDR_CYCLIC_MULT_REG {{lr_addr}} {{input_base_address}} {{lr_zero}} ;;   {#- slot0 <- row 2y,   tile it+1 -#}
+
+    INC {{lr_baddr}} 1 ;
+    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{input_base_address}} {{lr_s2}} ;;    {#- slot2 <- row 2y+1, tile it+1 -#}
+
+    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX.FIRST ;;
+
+    MULT.RC.VE {{lr_one}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;;
+
+    MULT.RC.VE {{lr_s2}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;;
+
+    MULT.RC.VE {{lr_s2p1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    ACC.MAX ;
+    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
     STR_POST_AAQ_REG {{lr_one}} cr4 ;;                   {#- stage half B -#}
 
 {#- ---- decimate both halves into one output row --------------------------- -#}
     LDR_CYCLIC_MULT_REG {{lr_zero}} cr4 {{lr_zero}} ;;   {#- slot0 <- scratch A -#}
-    LDR_CYCLIC_MULT_REG {{lr_one}}  cr4 {{lr_s1}} ;;     {#- slot1 <- scratch B -#}
-    MULT.RC.VE {{lr_zero}} cr1 0 {{lr_zero}} cr15 ;
+
+    LDR_CYCLIC_MULT_REG {{lr_one}} cr4 {{lr_s1}} ;;     {#- slot1 <- scratch B -#}
+
+    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
     ACC.STRIDE 64 on off {{lr_zero}} ;;                  {#- even columns of A -> R_ACC[0:64] -#}
-    MULT.RC.VE {{lr_s1}} cr1 0 {{lr_zero}} cr15 ;
+
+    MULT.RC.VE {{lr_s1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
     ACC.STRIDE 64 on off {{lr_half}} ;;                  {#- even columns of B -> R_ACC[64:128] -#}
-    ACTIVATE.QUANTIZE identity cr15 ;
+
+    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
     STR_POST_AAQ_REG {{lr_out}} cr3 ;;                   {#- OUT[c, oy, ot] -#}
-    ADD {{lr_out}} {{lr_out}} cr1 ;
-    ADD {{lr_ot}} {{lr_ot}} cr1 ;
+
+    ADD {{lr_out}} {{lr_out}} {{one}};
+    ADD {{lr_ot}} {{lr_ot}} {{one}};
     INC {{lr_itile}} 2 ;;                                {#- next output tile spans two more input tiles -#}
+
     BLT {{lr_ot}} cr7 tile_loop ;;
 
     ADD {{lr_rowb}} {{lr_rowb}} cr6 ;                    {#- next output row: += 2 * IN_ROW_STRIDE -#}
-    ADD {{lr_oy}} {{lr_oy}} cr1 ;;
+    ADD {{lr_oy}} {{lr_oy}} {{one}};;
+
     BLT {{lr_oy}} cr8 row_loop ;;
 
     ADD {{lr_cbase}} {{lr_cbase}} cr11 ;                 {#- next channel plane -#}
-    ADD {{lr_c}} {{lr_c}} cr1 ;;
+    ADD {{lr_c}} {{lr_c}} {{one}};;
+
     BLT {{lr_c}} cr9 chan_loop ;;
 
 end:

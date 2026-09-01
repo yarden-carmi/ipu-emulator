@@ -1,20 +1,21 @@
 # Pooling
 
-Two kernels, both over a `(C, H, W)` activation, both **wide-vector FP32 mode
+Five registered kernels, all over a `(C, H, W)` activation, all **wide-vector FP32 mode
 only** (`wide_vector_debug=True`) with no narrow (INT8/FP8) variant:
 
 | Kernel | Computes | Output extent |
 |---|---|---|
-| `maxpool2d_stride2` | 2×2 window, stride 2, no padding | `(C, H//2, W//2)` |
+| `maxpool2d_stride2` | 2×2 stride 2; every output XMEM row has two input XMEM rows | `(C, H//2, W//2)` |
+| `maxpool2d_stride2_tail` | Same operation; final output XMEM row has one input XMEM row | `(C, H//2, W//2)` |
 | `maxpool2d_window` | K×K window (K odd), stride 1, padded by `K//2` | `(C, H, W)` |
 | `maxpool2d_nms9` | **unrolled** 9×9, stride 1, padding 4 | `(C, H, W)` |
 | `maxpool2d_nms7` | **unrolled** 7×7, stride 1, padding 3 | `(C, H, W)` |
 
-All four loop over channels internally, so one launch pools the whole tensor.
+All five loop over channels internally, so one launch pools the whole tensor.
 
-`maxpool2d_stride2`'s domain is disjoint from the rest — it is the only
-stride-2 kernel — so `cost` never decides there, and its refusal names the
-others.
+The two stride-2 variants split that operation by XMEM geometry and have
+disjoint domains. Together their domain is disjoint from the stride-1 kernels,
+so `cost` never decides between them.
 
 The two `nms` kernels **overlap** `maxpool2d_window` on purpose: they compute
 exactly what it computes at K=9 and K=7, about 30% faster, and win on cost.
@@ -52,9 +53,10 @@ shift moves into the register instead — `dx` is a `+1` step on the read index.
 
 The two kernels then diverge on where the *rows* live.
 
-`maxpool2d_stride2` needs two spatial rows at once and holds both, in R_CYCLIC
-slots 0/1 and 2/3 — the second slot of each pair supplies element 128, which is
-where the `dx=1` tap of the last lane lands.
+The stride-2 variants need two spatial rows at once and hold their current XMEM
+rows in R_CYCLIC slots 0 and 2. The `dx=1` tap's final temporary position enters
+the following slot, but `ACC.STRIDE` always discards that position, so the
+following input XMEM row is not loaded.
 
 `maxpool2d_window` cannot: R_CYCLIC has four 128-element slots, and a K×K
 window needs K rows, so nothing above `K = 4` fits. It streams one row at a
@@ -159,27 +161,25 @@ any valid lane reads is `(TC-1) + (K-1) = 127` — the last element of the slot,
 with nothing to spare. A wide window therefore costs lanes: `K = 9` leaves 120
 usable columns of every 128.
 
-`maxpool2d_stride2` spends **no** lanes on a halo. One output XMEM row is 128
-output columns and so spans 256 input columns — two full-width input tiles —
-and the `+1` shift is satisfied by loading the *next* tile rather than by
-reserving lanes. `IN_ROW_STRIDE` is sized from what the kernel reads
-(`2 · OUT_TILES_PER_ROW`) rather than from `ceil(W/128)`, because a partly-filled
-last output tile still needs its input tiles to exist, plus one **guard tile**
-past them.
+The stride-2 variants use compact input storage: exactly `ceil(W/128)` XMEM rows
+per matrix row. One output XMEM row normally consumes two input XMEM rows. When
+the final output XMEM row consumes only one, the registry selects
+`maxpool2d_stride2_tail`; it runs the complete pairs first and then a separate
+one-input-row tail section. Neither variant needs an all-padding or guard XMEM
+row.
 
 ### `-FLT_MAX`, and where it is load-bearing
 
-Every lane a kernel may read that holds no image column is filled with
+Every position a kernel may read that holds no image column is filled with
 `-FLT_MAX`, the identity of a maximum: the border rows and halo elements of a
-padded plane, the columns past `W` in a partly-filled tile, and the guard tiles.
+padded plane, and the positions past `W` in a partly-filled final XMEM row.
 
 For `maxpool2d_window` this **is** the border: a centred window at the image
 edge genuinely reads outside the image, and no other fill value is correct.
 
-For `maxpool2d_stride2` it is not — output lane `j < W//2` reads input columns
-`2j` and `2j+1`, both below `W`, so no kept output ever touches a filled lane.
-It is filled anyway, so the discarded lanes stay finite and debuggable rather
-than holding whatever was there before.
+For the stride-2 variants it is not — output element `j < W//2` reads input
+elements `2j` and `2j+1`, both below `W`, so no kept output touches a filled
+position.
 
 `ACC.MAX.FIRST` seeds R_ACC from the first tap, so neither kernel needs a
 `-inf` seed *vector* for the accumulator — except `maxpool2d_window`, whose tap
