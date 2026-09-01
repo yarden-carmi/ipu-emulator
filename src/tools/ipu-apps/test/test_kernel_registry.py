@@ -23,6 +23,9 @@ from ipu_as.lark_tree import assemble_to_bin_file
 import ipu_apps.kernel_registry.registry as registry
 from ipu_apps.kernel_registry.layers import _ADAPTERS
 from ipu_apps.kernel_registry.identity.test import assert_identity_kernel
+from ipu_apps.pooling.maxpool2d_stride2.test import (
+    assert_maxpool2d_stride2_kernel,
+)
 from ipu_apps.kernel_registry import (
     KernelSpec,
     ShapeBundle,
@@ -89,6 +92,11 @@ def test_discovery_is_recursive():
 def test_registry_identity_example_loads_runs_and_reads_memory():
     """The built-in boilerplate is executable, not only a discoverable spec."""
     assert_identity_kernel(_APP_SRC)
+
+
+def test_registry_maxpool2d_stride2_loads_runs_and_reads_memory():
+    """The max-pool adaptation keeps the boilerplate memory-only."""
+    assert_maxpool2d_stride2_kernel(_APP_SRC)
 
 
 def test_every_spec_is_well_formed():
