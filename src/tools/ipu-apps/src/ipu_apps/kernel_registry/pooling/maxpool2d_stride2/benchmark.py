@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from ipu_as.lark_tree import assemble_to_bin_file
+from ipu_emu.debug_cli import debug_prompt
 from ipu_emu.ipu import LANES
 from ipu_apps.kernel_registry import resolve
 
@@ -81,7 +82,10 @@ def _run_shape(
         **verdict.kwargs,
     )
     started = time.perf_counter()
-    _state, cycles = app.run(max_cycles=20_000_000)
+    _state, cycles = app.run(
+        max_cycles=20_000_000,
+        debug_callback=debug_prompt,
+    )
     duration_seconds = time.perf_counter() - started
 
     output = np.frombuffer(output_path.read_bytes(), dtype="<f4").reshape(

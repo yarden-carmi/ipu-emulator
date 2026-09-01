@@ -71,7 +71,7 @@
       read from the start-of-word SNAPSHOT, so every load lands at least one
       word before the multiply that consumes it.
 
-    CR map (set by the harness; {{zero}}/{{one}}are READ-ONLY hardware constants):
+    CR map (set by the harness; {{cr_zero}}/{{cr_one}}are READ-ONLY hardware constants):
       CR0  = 0                        CR1 = 1  (-> 1.0 scalar; every +1)
       CR2  = INPUT_BASE   (rows)      CR3  = OUTPUT_BASE  (rows)
       CR4  = SCRATCH_BASE (rows; 2 rows)
@@ -105,77 +105,80 @@
 {%- set lr_half  = "lr13" -%}  {#- 2: ACC.STRIDE offset selecting R_ACC base 64 -#}
 {%- set lr_itile = "lr14" -%}  {#- address of (spatial row 2*oy, input tile 2*ot) -#}
 
-{%- set zero  = "cr0"  -%}
-{%- set one  = "cr1"  -%}
-{%- set input_base_address  = "cr2"  -%}
-{%- set xmem_row_stride  = "cr5"  -%} #how many xmem rows needed for one matrix row 
-{%- set cyclic_slot_1  = "cr10"  -%} #cr10 = 128
-{%- set dstructure  = "cr15"  -%} 
+{%- set cr_zero  = "cr0"  -%}
+{%- set cr_one  = "cr1"  -%}
+{%- set cr_input_base_address  = "cr2"  -%}
+{%- set cr_xmem_row_stride  = "cr5"  -%} #how many xmem rows needed for one matrix row 
+{%- set cr_cyclic_slot_1  = "cr10"  -%} #cr10 = 128
+{%- set cr_dstructure  = "cr15"  -%} 
 
 
 
-    SET {{lr_zero}} {{zero}} ;#lr_zero = 0
-    SET {{lr_s1}} {{cyclic_slot_1}} ;#lr_s1 = 128
-    SET {{lr_out}} {{zero}} ;;#lr_out = 0
+    SET {{lr_zero}} {{cr_zero}} ;# lr_zero = 0
+    SET {{lr_s1}} {{cr_cyclic_slot_1}} ;# lr_s1 = 128
+    SET {{lr_out}} {{cr_zero}} ;;# lr_out = 0
     
-    SET {{lr_cbase}} {{zero}} ;#lr_cbase = 0
-    SET {{lr_one}} {{one}} ;#lr_one = 1                      
-    ADD {{lr_s2}} {{lr_s1}} {{lr_s1}} ;;#lr_s2 = 256          
+    SET {{lr_cbase}} {{cr_zero}} ;# lr_cbase = 0
+    SET {{lr_one}} {{cr_one}} ;# lr_one = 1                      
+    ADD {{lr_s2}} {{lr_s1}} {{lr_s1}} ;;# lr_s2 = 256          
 
-    SET {{lr_c}} {{zero}} ;#lr_c = 0
-    ADD {{lr_s2p1}} {{lr_s2}} {{one}};#lr_s2p1 = 257
-    ADD {{lr_half}} {{lr_one}} {{one}};;#lr_half = 2
+    SET {{lr_c}} {{cr_zero}} ;# lr_c = 0
+    ADD {{lr_s2p1}} {{lr_s2}} {{cr_one}};# lr_s2p1 = 257
+    ADD {{lr_half}} {{lr_one}} {{cr_one}};;# lr_half = 2
 
 chan_loop:
-    SET {{lr_oy}} {{zero}} ; #lr_oy = 0 
-    ADD {{lr_rowb}} {{lr_cbase}} {{zero}} ;;#lr_rowb = lr_cbase
+    SET {{lr_oy}} {{cr_zero}} ; # lr_oy = 0 
+    ADD {{lr_rowb}} {{lr_cbase}} {{cr_zero}} ;;# lr_rowb = lr_cbase
 
 row_loop:
-    SET {{lr_ot}} {{zero}} ;#lr_ot = 0
-    ADD {{lr_itile}} {{lr_rowb}} {{zero}} ;;#lr_itile = lr_rowb
+    SET {{lr_ot}} {{cr_zero}} ;# lr_ot = 0
+    ADD {{lr_itile}} {{lr_rowb}} {{cr_zero}} ;;# lr_itile = lr_rowb
 
 tile_loop:
 {#- ---- HALF A: input tile 2*ot --------------------------------------------- -#}
-    ADD {{lr_addr}} {{lr_itile}} {{zero}} ; #lr_addr = lr_itile
-    ADD {{lr_baddr}} {{lr_itile}} {{xmem_row_stride}};#lr_baddr = lr_itile + xmem_row_stride
-    LDR_CYCLIC_MULT_REG {{lr_addr}} {{input_base_address}} {{lr_zero}} ;;#R_CYCLIC[0...127] = Memory[row(input_base_address + lr_addr)]
+    ADD {{lr_addr}} {{lr_itile}} {{cr_zero}} ; # lr_addr = lr_itile
+    ADD {{lr_baddr}} {{lr_itile}} {{cr_xmem_row_stride}};# lr_baddr = lr_itile + xmem_row_stride
+    LDR_CYCLIC_MULT_REG {{lr_addr}} {{cr_input_base_address}} {{lr_zero}} ;;# R_CYCLIC[0...127] = Memory[row(input_base_address + lr_addr)]
 
-    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{input_base_address}} {{lr_s2}} ;;#R_CYCLIC[256...511] = Memory[row(input_base_address + lr_baddr)]
+    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{cr_input_base_address}} {{lr_s2}} ;;# R_CYCLIC[256...511] = Memory[row(input_base_address + lr_baddr)]
+    
+    #todo: load mask. currently assuming that mask is all 1s
+    MULT.RC.VE {{lr_zero}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};# MULT_RES[0...127] = R_CYCLIC[0...127] * 1
+    ACC.MAX.FIRST;;# R_ACC[0...127] = MULT_RES[0...127]
 
-    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
-    ACC.MAX.FIRST ;;   {#- dy 0 dx 0 -#}
+    MULT.RC.VE {{lr_one}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}}; # MULT_RES[0...127] = R_CYCLIC[1...128] * 1
+    ACC.MAX ;;# R_ACC[i] = max(R_ACC[i], MULT_RES[i])
 
-    MULT.RC.VE {{lr_one}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
-    ACC.MAX ;;         {#- dy 0 dx 1 -#}
+    MULT.RC.VE {{lr_s2}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};# MULT_RES[0...127] = R_CYCLIC[256...383] * 1
+    ACC.MAX ;; # R_ACC[i] = max(R_ACC[i], MULT_RES[i])
 
-    MULT.RC.VE {{lr_s2}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
-    ACC.MAX ;;         {#- dy 1 dx 0 -#}
-
-    MULT.RC.VE {{lr_s2p1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
-    ACC.MAX ;
-    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
-    STR_POST_AAQ_REG {{lr_zero}} cr4 ;;                  {#- dy 1 dx 1 | stage half A -#}
+    MULT.RC.VE {{lr_s2p1}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};# MULT_RES[0...127] = R_CYCLIC[257...384] * 1
+    ACC.MAX ;# R_ACC[i] = max(R_ACC[i], MULT_RES[i])
+    ACTIVATE.QUANTIZE identity {{cr_dstructure}};
+    STR_POST_AAQ_REG {{lr_zero}} cr4;
+    break;;
 
 {#- ---- HALF B: input tile 2*ot+1 ------------------------------------------- -#}
-    ADD {{lr_addr}} {{lr_itile}} {{one}};
-    ADD {{lr_baddr}} {{lr_itile}} {{xmem_row_stride}};
-    LDR_CYCLIC_MULT_REG {{lr_addr}} {{input_base_address}} {{lr_zero}} ;;   {#- slot0 <- row 2y,   tile it+1 -#}
+    ADD {{lr_addr}} {{lr_itile}} {{cr_one}};
+    ADD {{lr_baddr}} {{lr_itile}} {{cr_xmem_row_stride}};
+    LDR_CYCLIC_MULT_REG {{lr_addr}} {{cr_input_base_address}} {{lr_zero}} ;
+    break;;   {#- slot0 <- row 2y,   tile it+1 -#}
 
     INC {{lr_baddr}} 1 ;
-    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{input_base_address}} {{lr_s2}} ;;    {#- slot2 <- row 2y+1, tile it+1 -#}
+    LDR_CYCLIC_MULT_REG {{lr_baddr}} {{cr_input_base_address}} {{lr_s2}} ;;    {#- slot2 <- row 2y+1, tile it+1 -#}
 
-    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_zero}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.MAX.FIRST ;;
 
-    MULT.RC.VE {{lr_one}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_one}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.MAX ;;
 
-    MULT.RC.VE {{lr_s2}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_s2}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.MAX ;;
 
-    MULT.RC.VE {{lr_s2p1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_s2p1}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.MAX ;
-    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
+    ACTIVATE.QUANTIZE identity {{cr_dstructure}};
     STR_POST_AAQ_REG {{lr_one}} cr4 ;;                   {#- stage half B -#}
 
 {#- ---- decimate both halves into one output row --------------------------- -#}
@@ -183,28 +186,28 @@ tile_loop:
 
     LDR_CYCLIC_MULT_REG {{lr_one}} cr4 {{lr_s1}} ;;     {#- slot1 <- scratch B -#}
 
-    MULT.RC.VE {{lr_zero}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_zero}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.STRIDE 64 on off {{lr_zero}} ;;                  {#- even columns of A -> R_ACC[0:64] -#}
 
-    MULT.RC.VE {{lr_s1}} {{one}} 0 {{lr_zero}} {{cyclic_slot_1}};
+    MULT.RC.VE {{lr_s1}} {{cr_one}} 0 {{lr_zero}} {{cr_dstructure}};
     ACC.STRIDE 64 on off {{lr_half}} ;;                  {#- even columns of B -> R_ACC[64:128] -#}
 
-    ACTIVATE.QUANTIZE identity {{cyclic_slot_1}};
+    ACTIVATE.QUANTIZE identity {{cr_dstructure}};
     STR_POST_AAQ_REG {{lr_out}} cr3 ;;                   {#- OUT[c, oy, ot] -#}
 
-    ADD {{lr_out}} {{lr_out}} {{one}};
-    ADD {{lr_ot}} {{lr_ot}} {{one}};
+    ADD {{lr_out}} {{lr_out}} {{cr_one}};
+    ADD {{lr_ot}} {{lr_ot}} {{cr_one}};
     INC {{lr_itile}} 2 ;;                                {#- next output tile spans two more input tiles -#}
 
     BLT {{lr_ot}} cr7 tile_loop ;;
 
     ADD {{lr_rowb}} {{lr_rowb}} cr6 ;                    {#- next output row: += 2 * IN_ROW_STRIDE -#}
-    ADD {{lr_oy}} {{lr_oy}} {{one}};;
+    ADD {{lr_oy}} {{lr_oy}} {{cr_one}};;
 
     BLT {{lr_oy}} cr8 row_loop ;;
 
     ADD {{lr_cbase}} {{lr_cbase}} cr11 ;                 {#- next channel plane -#}
-    ADD {{lr_c}} {{lr_c}} {{one}};;
+    ADD {{lr_c}} {{lr_c}} {{cr_one}};;
 
     BLT {{lr_c}} cr9 chan_loop ;;
 
