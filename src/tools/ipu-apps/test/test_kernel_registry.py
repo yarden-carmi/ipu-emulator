@@ -23,7 +23,7 @@ from ipu_as.lark_tree import assemble_to_bin_file
 import ipu_apps.kernel_registry.registry as registry
 from ipu_apps.kernel_registry.layers import _ADAPTERS
 from ipu_apps.kernel_registry.identity.test import assert_identity_kernel
-from ipu_apps.pooling.maxpool2d_stride2.test import (
+from ipu_apps.kernel_registry.pooling.maxpool2d_stride2.test import (
     assert_maxpool2d_stride2_kernel,
 )
 from ipu_apps.kernel_registry import (
