@@ -2,6 +2,7 @@ load("@ipu_as_deps//:requirements.bzl", "requirement")
 load("@ipu_apps_pyproject//:deps.bzl", "get_requirements")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("@rules_python_pytest//python_pytest:defs.bzl", "py_pytest_test")
+load("//:ipu_app.bzl", "ipu_app")
 load("//:asm_rules.bzl", "assemble_asm")
 
 package(default_visibility = ["//visibility:public"])
@@ -21,124 +22,70 @@ py_library(
     ] + get_requirements(requirement),
 )
 
-# -- Fully-connected app ---------------------------------------------------
-
-exports_files([
-    "src/ipu_apps/fully_connected/fully_connected.asm",
-])
-
-filegroup(
-    name = "fc_test_data",
-    srcs = glob(["src/ipu_apps/fully_connected/test_data_format/**/*.bin"]),
-)
-
-assemble_asm(
-    name = "assemble_fully_connected",
-    src = "src/ipu_apps/fully_connected/fully_connected.asm",
-)
-
-py_binary(
+# Each declaration uses the same registry frontend and the adjacent test.py.
+ipu_app(
     name = "fully_connected",
-    srcs = ["src/ipu_apps/fully_connected/__main__.py"],
-    main = "src/ipu_apps/fully_connected/__main__.py",
-    data = [
-        ":assemble_fully_connected.bin",
-        ":fc_test_data",
-    ],
-    env = {
-        "FC_INST_BIN": "$(rootpath :assemble_fully_connected.bin)",
-        "FC_DATA_DIR": "src/tools/ipu-apps/src/ipu_apps/fully_connected/test_data_format",
-    },
-    imports = ["src"],
+    kernel_package = "src/ipu_apps/kernels/fully_connected",
+    data = glob(["src/ipu_apps/kernels/fully_connected/test_data_format/**/*.bin"]),
     deps = [":ipu_apps_lib"],
+    test_deps = [requirement("pytest")],
 )
 
-py_pytest_test(
-    name = "test_fully_connected",
-    srcs = ["test/test_fully_connected.py"],
-    data = [
-        ":assemble_fully_connected.bin",
-        ":fc_test_data",
-    ],
-    env = {
-        "FC_INST_BIN": "$(rootpath :assemble_fully_connected.bin)",
-        "FC_DATA_DIR": "src/tools/ipu-apps/src/ipu_apps/fully_connected/test_data_format",
-    },
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
+[
+    ipu_app(
+        name = name,
+        kernel_package = "src/ipu_apps/kernels/softmax/" + name,
+        deps = [":ipu_apps_lib"],
+        test_deps = [requirement("pytest")],
+    )
+    for name in [
+        "softmax_rows", "softmax_rows_partial", "softmax_rows_long",
+        "softmax_columns", "softmax_columns_packed",
+    ]
+]
+
+ipu_app(
+    name = "identity",
+    kernel_package = "src/ipu_apps/kernels/identity",
+    deps = [":ipu_apps_lib"],
+    test_deps = [requirement("pytest")],
 )
 
-# -- softmax apps (FP32 wide-vector) ---------------------------------------
-#
-# Assembles the .asm in-process (assemble_to_bin_file in the test fixture), so
-# the app .asm is provided as data; no pre-assembled .bin target is needed.
+
+# Every remaining assembly kernel uses the shared case runner and debugger.
+[
+    ipu_app(
+        name = name,
+        kernel_package = kernel_package,
+        deps = [":ipu_apps_lib"],
+        test_deps = [requirement("pytest")],
+        # The stride-2 package's shared test.py exercises both assembly files.
+        data = glob(
+            ["src/ipu_apps/kernels/pooling/maxpool2d_stride2/*.asm"],
+            exclude = [kernel_package + "/" + name + ".asm"],
+        ) if name.startswith("maxpool2d_stride2") else [],
+    )
+    for name, kernel_package in [
+        ("conv1x1", "src/ipu_apps/kernels/convolutions/conv/conv1x1"),
+        ("conv3x3_relu", "src/ipu_apps/kernels/convolutions/conv/conv3x3_relu"),
+        ("conv3x3_relu_cin1", "src/ipu_apps/kernels/convolutions/conv/conv3x3_relu_cin1"),
+        ("channel_peak", "src/ipu_apps/kernels/detect/channel_peak"),
+        ("score_threshold", "src/ipu_apps/kernels/detect/score_threshold"),
+        ("maxpool2d_nms7", "src/ipu_apps/kernels/pooling/maxpool2d_nms7"),
+        ("maxpool2d_nms9", "src/ipu_apps/kernels/pooling/maxpool2d_nms9"),
+        ("maxpool2d_window", "src/ipu_apps/kernels/pooling/maxpool2d_window"),
+        ("l2_normalize_channels", "src/ipu_apps/kernels/normalize/l2_normalize_channels"),
+        ("depth_to_space", "src/ipu_apps/kernels/reshape/depth_to_space"),
+        ("maxpool2d_stride2", "src/ipu_apps/kernels/pooling/maxpool2d_stride2"),
+        ("maxpool2d_stride2_tail", "src/ipu_apps/kernels/pooling/maxpool2d_stride2"),
+    ]
+]
 
 py_pytest_test(
-    name = "test_softmax_rows",
-    srcs = ["test/test_softmax_rows.py"],
-    data = [
-        "src/ipu_apps/softmax/softmax_rows/softmax_rows.asm",
-    ],
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
-)
-
-py_pytest_test(
-    name = "test_softmax_rows_partial",
-    srcs = ["test/test_softmax_rows_partial.py"],
-    data = [
-        "src/ipu_apps/softmax/softmax_rows_partial/softmax_rows_partial.asm",
-    ],
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
-)
-
-py_pytest_test(
-    name = "test_softmax_rows_long",
-    srcs = ["test/test_softmax_rows_long.py"],
-    data = [
-        "src/ipu_apps/softmax/softmax_rows_long/softmax_rows_long.asm",
-    ],
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
-)
-
-py_pytest_test(
-    name = "test_softmax_columns",
-    srcs = ["test/test_softmax_columns.py"],
-    data = [
-        "src/ipu_apps/softmax/softmax_columns/softmax_columns.asm",
-    ],
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
-)
-
-py_pytest_test(
-    name = "test_softmax_columns_packed",
-    srcs = ["test/test_softmax_columns_packed.py"],
-    data = [
-        "src/ipu_apps/softmax/softmax_columns_packed/softmax_columns_packed.asm",
-    ],
-    imports = ["src"],
-    deps = [
-        ":ipu_apps_lib",
-        requirement("pytest"),
-    ],
+    name = "test_harness_factory",
+    srcs = ["test/test_harness_factory.py"],
+    data = ["pyproject.toml"] + glob(["src/ipu_apps/**/*.asm", "src/ipu_apps/kernels/fully_connected/test_data_format/**/*.bin"]),
+    deps = [":ipu_apps_lib", requirement("pytest")],
 )
 
 # Runs every softmax app, so it needs all five .asm files.
@@ -146,11 +93,11 @@ py_pytest_test(
     name = "test_softmax_layout_roundtrip",
     srcs = ["test/test_softmax_layout_roundtrip.py"],
     data = [
-        "src/ipu_apps/softmax/softmax_columns/softmax_columns.asm",
-        "src/ipu_apps/softmax/softmax_columns_packed/softmax_columns_packed.asm",
-        "src/ipu_apps/softmax/softmax_rows/softmax_rows.asm",
-        "src/ipu_apps/softmax/softmax_rows_long/softmax_rows_long.asm",
-        "src/ipu_apps/softmax/softmax_rows_partial/softmax_rows_partial.asm",
+        "src/ipu_apps/kernels/softmax/softmax_columns/softmax_columns.asm",
+        "src/ipu_apps/kernels/softmax/softmax_columns_packed/softmax_columns_packed.asm",
+        "src/ipu_apps/kernels/softmax/softmax_rows/softmax_rows.asm",
+        "src/ipu_apps/kernels/softmax/softmax_rows_long/softmax_rows_long.asm",
+        "src/ipu_apps/kernels/softmax/softmax_rows_partial/softmax_rows_partial.asm",
     ],
     imports = ["src"],
     deps = [
@@ -184,6 +131,18 @@ py_pytest_test(
     ],
 )
 
+py_binary(
+    name = "benchmark_maxpool2d_stride2",
+    srcs = ["src/ipu_apps/kernels/pooling/maxpool2d_stride2/benchmark.py"],
+    main = "src/ipu_apps/kernels/pooling/maxpool2d_stride2/benchmark.py",
+    data = [
+        "src/ipu_apps/kernels/pooling/maxpool2d_stride2/maxpool2d_stride2.asm",
+        "src/ipu_apps/kernels/pooling/maxpool2d_stride2/maxpool2d_stride2_tail.asm",
+    ],
+    imports = ["src"],
+    deps = [":ipu_apps_lib"],
+)
+
 # Checks the routing tables printed in the docs against what the registry
 # actually answers. The tables are checked-in text, so without this they are a
 # second copy of the routing rules -- the copy that goes stale.
@@ -196,4 +155,23 @@ py_pytest_test(
         ":ipu_apps_lib",
         requirement("pytest"),
     ],
+)
+
+# Retained for consumers that need the assembled artifact directly.
+assemble_asm(
+    name = "assemble_fully_connected",
+    src = "src/ipu_apps/kernels/fully_connected/fully_connected.asm",
+)
+
+py_pytest_test(
+    name = "test_debug_launch",
+    srcs = ["test/test_debug_launch.py"],
+    data = glob(["src/ipu_apps/**/*.asm", "src/ipu_apps/kernels/fully_connected/test_data_format/**/*.bin"]),
+    deps = [":ipu_apps_lib", requirement("pytest")],
+)
+
+py_pytest_test(
+    name = "test_bazel_entry",
+    srcs = ["test/test_bazel_entry.py"],
+    deps = [":ipu_apps_lib", requirement("pytest")],
 )

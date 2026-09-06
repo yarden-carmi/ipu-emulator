@@ -25,13 +25,13 @@ import pytest
 
 from ipu_as.lark_tree import assemble_to_bin_file
 
-from ipu_apps.softmax.softmax_columns import SoftmaxColumnsApp
-from ipu_apps.softmax.softmax_columns_packed import SoftmaxColumnsPackedApp
-from ipu_apps.softmax.softmax_rows import SoftmaxRowsApp
-from ipu_apps.softmax.softmax_rows_long import SoftmaxRowsLongApp
-from ipu_apps.softmax.softmax_rows_partial import SoftmaxRowsPartialApp
+from ipu_apps.kernels.softmax.softmax_columns import SoftmaxColumnsApp
+from ipu_apps.kernels.softmax.softmax_columns_packed import SoftmaxColumnsPackedApp
+from ipu_apps.kernels.softmax.softmax_rows import SoftmaxRowsApp
+from ipu_apps.kernels.softmax.softmax_rows_long import SoftmaxRowsLongApp
+from ipu_apps.kernels.softmax.softmax_rows_partial import SoftmaxRowsPartialApp
 
-_SRC = Path(__file__).resolve().parents[1] / "src/ipu_apps/softmax"
+_SRC = Path(__file__).resolve().parents[1] / "src/ipu_apps/kernels/softmax"
 
 # (id, app class, asm dir name, ctor kwargs, (rows, cols), softmax axis).
 # Shapes are chosen so each app hits its padding-heavy regime -- that is where

@@ -144,7 +144,7 @@ genrule(
         mkdir -p "$(@D)/docs_temp/content/assets"
         for artifact in $(locations :generate_instruction_format_artifacts); do \
           base=$$(basename "$$artifact"); \
-          cp "$$ORIGDIR/$$artifact" "$(@D)/docs_temp/content/assets/$$base"; \
+          cp -f "$$ORIGDIR/$$artifact" "$(@D)/docs_temp/content/assets/$$base"; \
         done
 
         # Build with mkdocs (execroot must retain .git; use no-sandbox on this genrule).

@@ -1516,7 +1516,13 @@ class Ipu:
         if self._wide_vector_active():
             for i in range(active):
                 raw = struct.unpack_from(fmt, acc_buf, i * 4)[0]
-                y = apply_activation(fn_id, float(raw), elu_alpha=self.state.elu_alpha)
+                y = apply_activation(
+                    fn_id,
+                    float(raw),
+                    elu_alpha=self.state.elu_alpha,
+                    window_a=self.state.window_a,
+                    window_b=self.state.window_b,
+                )
                 if fmt == "<i":
                     yi = int(round(y))
                     if yi < -2147483648:
@@ -1548,7 +1554,13 @@ class Ipu:
         result = bytearray(128)
         for i in range(active):
             raw = struct.unpack_from(fmt, acc_buf, i * 4)[0]
-            y = apply_activation(fn_id, float(raw), elu_alpha=self.state.elu_alpha)
+            y = apply_activation(
+                fn_id,
+                float(raw),
+                elu_alpha=self.state.elu_alpha,
+                window_a=self.state.window_a,
+                window_b=self.state.window_b,
+            )
             result[i] = max(-128, min(127, int(round(y)))) & 0xFF
         self.state.regfile.set_post_aaq_reg(result + bytearray(384))
 
@@ -1687,6 +1699,14 @@ class Ipu:
     # VLIW Execution
     # -----------------------------------------------------------------------
 
+    def check_break(self) -> BreakResult:
+        """Evaluate the current instruction's BREAK slot before side effects."""
+        inst = self.state.inst_mem[self.state.program_counter]
+        if inst is None:
+            return BreakResult.CONTINUE
+        self._take_snapshot()
+        return self.dispatch_instruction("break", inst)
+
     def execute_vliw_cycle(self) -> BreakResult:
         """Execute one VLIW cycle.
 
@@ -1705,10 +1725,8 @@ class Ipu:
             self.state.program_counter += 1
             return BreakResult.CONTINUE
 
-        self._take_snapshot()
-
         # Break runs first — may halt before side effects
-        result = self.dispatch_instruction("break", inst)
+        result = self.check_break()
         if result == BreakResult.BREAK:
             return BreakResult.BREAK
 
