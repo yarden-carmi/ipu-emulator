@@ -46,8 +46,12 @@ def load_cases(kernel_name: str) -> Mapping[str, KernelCase]:
     spec = kernel_spec(kernel_name)
     module_name = spec.resource_package + ".cases"
     try:
-        cases = import_module(module_name).CASES
-    except (ImportError, AttributeError) as exc:
+        module = import_module(module_name)
+        # A package may declare several SPECS sharing assembly/harness code.
+        # Each exact kernel still needs its own default and supported cases.
+        cases = (module.CASES_BY_KERNEL[kernel_name]
+                 if hasattr(module, "CASES_BY_KERNEL") else module.CASES)
+    except (ImportError, AttributeError, KeyError) as exc:
         raise ValueError(f"{kernel_name}: cannot load CASES from {module_name}: {exc}") from exc
     if (not isinstance(cases, Mapping) or "default" not in cases
             or not all(isinstance(n, str) and isinstance(c, KernelCase) for n, c in cases.items())):

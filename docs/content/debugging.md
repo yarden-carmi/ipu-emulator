@@ -12,6 +12,8 @@ bazel test //src/tools/ipu-apps:test_softmax_rows
 bazel run --config=debug //src/tools/ipu-apps:softmax_rows -- --rows 8
 bazel run --config=debug //src/tools/ipu-apps:identity -- --case single_row
 bazel run --config=debug //src/tools/ipu-apps:fully_connected
+bazel run --config=debug //src/tools/ipu-apps:maxpool2d_window
+bazel run //src/tools/ipu-apps:conv3x3_relu -- --list-cases
 ```
 
 `--config=debug` sets `IPU_DEBUG_TUI=1` for the launched application through
@@ -29,11 +31,31 @@ restores the terminal, cleans temporary files, and exits successfully without
 writing or checking incomplete output. Completion runs the normal teardown
 and case checks.
 
-All seven app targets support this configuration: `fully_connected`,
-`identity`, `softmax_rows`, `softmax_rows_partial`, `softmax_rows_long`,
-`softmax_columns`, and `softmax_columns_packed`. Use ordinary Bazel labels;
-inside the apps package, `:identity` is also valid. Run each suite with its
-`test_<kernel>` label. There is no custom Bazel command or repository wrapper.
+All 19 assembly kernels under `src/tools/ipu-apps` have runnable targets:
+
+| Family | Targets |
+| --- | --- |
+| Basic | `identity`, `fully_connected` |
+| Softmax | `softmax_rows`, `softmax_rows_partial`, `softmax_rows_long`, `softmax_columns`, `softmax_columns_packed` |
+| Pooling | `maxpool2d_stride2`, `maxpool2d_stride2_tail`, `maxpool2d_window`, `maxpool2d_nms7`, `maxpool2d_nms9` |
+| Convolution | `conv1x1`, `conv3x3_relu`, `conv3x3_relu_cin1` |
+| Normalization | `l2_normalize_channels` |
+| Detection | `channel_peak`, `score_threshold` |
+| Reshape | `depth_to_space` |
+
+Use `bazel run --config=debug //src/tools/ipu-apps:<kernel>` to debug its
+checked default case. Add `-- --list-cases` to list cases, `-- --case tile_boundary`
+to select a boundary case on the pooling, convolution, normalization, detection,
+or reshape kernels, or `-- --help` to see shape options. Run each suite with
+its `test_<kernel>` label, or all suites with `bazel test //src/tools/ipu-apps:all`.
+
+Cases prepare files and compare completed output against reference results.
+The new memory-only harnesses load preformatted FP32 XMEM rows; their input
+images include any weights, constants, padding, guard rows and scratch space.
+Output exported with `--output` retains the kernel's tiled memory layout.
+`channel_peak` exports confidence rows followed by keep rows; `score_threshold`
+exports selected rows followed by a count row whose first lane is the total.
+The two stride-2 kernels retain their existing input-only file contract.
 
 An interactive input and output terminal is required. Terminal initialization
 failures abort the launch. Plain `bazel run` and `bazel test` remain

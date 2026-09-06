@@ -51,6 +51,36 @@ ipu_app(
     test_deps = [requirement("pytest")],
 )
 
+
+# Every remaining assembly kernel uses the shared case runner and debugger.
+[
+    ipu_app(
+        name = name,
+        kernel_package = kernel_package,
+        deps = [":ipu_apps_lib"],
+        test_deps = [requirement("pytest")],
+        # The stride-2 package's shared test.py exercises both assembly files.
+        data = glob(
+            ["src/ipu_apps/kernel_registry/pooling/maxpool2d_stride2/*.asm"],
+            exclude = [kernel_package + "/" + name + ".asm"],
+        ) if name.startswith("maxpool2d_stride2") else [],
+    )
+    for name, kernel_package in [
+        ("conv1x1", "src/ipu_apps/convolutions_universal/conv/conv1x1"),
+        ("conv3x3_relu", "src/ipu_apps/convolutions_universal/conv/conv3x3_relu"),
+        ("conv3x3_relu_cin1", "src/ipu_apps/convolutions_universal/conv/conv3x3_relu_cin1"),
+        ("channel_peak", "src/ipu_apps/detect/channel_peak"),
+        ("score_threshold", "src/ipu_apps/detect/score_threshold"),
+        ("maxpool2d_nms7", "src/ipu_apps/kernel_registry/pooling/maxpool2d_nms7"),
+        ("maxpool2d_nms9", "src/ipu_apps/kernel_registry/pooling/maxpool2d_nms9"),
+        ("maxpool2d_window", "src/ipu_apps/kernel_registry/pooling/maxpool2d_window"),
+        ("l2_normalize_channels", "src/ipu_apps/normalize/l2_normalize_channels"),
+        ("depth_to_space", "src/ipu_apps/reshape/depth_to_space"),
+        ("maxpool2d_stride2", "src/ipu_apps/kernel_registry/pooling/maxpool2d_stride2"),
+        ("maxpool2d_stride2_tail", "src/ipu_apps/kernel_registry/pooling/maxpool2d_stride2"),
+    ]
+]
+
 py_pytest_test(
     name = "test_harness_factory",
     srcs = ["test/test_harness_factory.py"],
@@ -136,6 +166,6 @@ assemble_asm(
 py_pytest_test(
     name = "test_debug_launch",
     srcs = ["test/test_debug_launch.py"],
-    data = ["src/ipu_apps/kernel_registry/identity/identity.asm"],
+    data = glob(["src/ipu_apps/**/*.asm", "src/ipu_apps/fully_connected/test_data_format/**/*.bin"]),
     deps = [":ipu_apps_lib", requirement("pytest")],
 )

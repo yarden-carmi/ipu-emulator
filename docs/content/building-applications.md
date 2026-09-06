@@ -140,6 +140,9 @@ The macro supplies the shared runner and a `test_my_app` target. It packages
 `my_app.asm`; if `SPEC.asm` uses a different filename, pass the same relative
 path as the macro's `asm` argument. Cases assemble the source at runtime, so no
 instruction-path or fixture-directory environment variables are needed.
+A package declaring multiple `SPECS` can expose `CASES_BY_KERNEL` in `cases.py`:
+a mapping from each exact kernel name to its case mapping (each including
+`default`). Single-kernel packages continue to expose `CASES`.
 
 ```bash
 bazel run //src/tools/ipu-apps:my_app -- --list-cases

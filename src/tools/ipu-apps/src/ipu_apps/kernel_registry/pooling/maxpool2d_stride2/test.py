@@ -100,3 +100,18 @@ def assert_maxpool2d_stride2_kernel(app_src: Path) -> None:
             )
             assert state.stats.xmem_reads == channels * out_height * reads_per_output_row
             assert np.array_equal(tiled_output[:, :, :out_width], expected)
+
+
+# Both exact selections must work through the same runner used by bazel run.
+import pytest
+from ipu_apps.kernel_registry.cases import load_cases, run_case
+
+
+@pytest.mark.parametrize("kernel,case", [
+    (kernel, case)
+    for kernel in ("maxpool2d_stride2", "maxpool2d_stride2_tail")
+    for case in load_cases(kernel)
+])
+def test_runner_case(kernel, case):
+    state, _ = run_case(kernel, load_cases(kernel)[case])
+    assert state.is_halted
