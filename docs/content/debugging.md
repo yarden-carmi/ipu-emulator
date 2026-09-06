@@ -8,7 +8,7 @@ Use native Bazel commands with a registered kernel target:
 
 ```bash
 bazel run //src/tools/ipu-apps:softmax_rows -- --rows 8
-bazel test //src/tools/ipu-apps:test_softmax_rows
+bazel test //src/tools/ipu-apps:softmax_rows
 bazel run --config=debug //src/tools/ipu-apps:softmax_rows -- --rows 8
 bazel run --config=debug //src/tools/ipu-apps:identity -- --case single_row
 bazel run --config=debug //src/tools/ipu-apps:fully_connected
@@ -16,8 +16,9 @@ bazel run --config=debug //src/tools/ipu-apps:maxpool2d_window
 bazel run //src/tools/ipu-apps:conv3x3_relu -- --list-cases
 ```
 
-`--config=debug` sets `IPU_DEBUG_TUI=1` for the launched application through
-`.bazelrc`. The shared harness opens the TUI at cycle 0 after loading the
+`--config=debug` sets `IPU_DEBUG_TUI=1` through both the run and test
+environments in `.bazelrc`. The shared launcher restores terminal output and
+foreground ownership while debugging an executable test target. The shared harness opens the TUI at cycle 0 after loading the
 program, inputs, and registers, before any instruction executes. Every harness
 using `IpuApp.run()` supports this; no BREAK instruction, per-kernel launch
 code, or debugger import is required. Case selection and arguments are the
@@ -46,8 +47,10 @@ All 19 assembly kernels under `src/tools/ipu-apps` have runnable targets:
 Use `bazel run --config=debug //src/tools/ipu-apps:<kernel>` to debug its
 checked default case. Add `-- --list-cases` to list cases, `-- --case tile_boundary`
 to select a boundary case on the pooling, convolution, normalization, detection,
-or reshape kernels, or `-- --help` to see shape options. Run each suite with
-its `test_<kernel>` label, or all suites with `bazel test //src/tools/ipu-apps:all`.
+or reshape kernels, or `-- --help` to see shape options. Use the same label for tests, for example
+`bazel test //src/tools/ipu-apps:maxpool2d_stride2`. The older `test_<kernel>`
+labels remain aliases. Run all suites with `bazel test //src/tools/ipu-apps:all`.
+Pass pytest arguments with `--test_arg`, or select tests with `--test_filter`.
 
 Cases prepare files and compare completed output against reference results.
 The new memory-only harnesses load preformatted FP32 XMEM rows; their input
