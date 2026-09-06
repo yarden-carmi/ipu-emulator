@@ -34,7 +34,7 @@ Port of `fully_connected.c` — loads inputs/weights, transposes weights,
 runs the FC assembly, dumps output activations.
 
 ```python
-from ipu_apps.fully_connected import FullyConnectedApp
+from ipu_apps.kernels.fully_connected import FullyConnectedApp
 
 app = FullyConnectedApp(
     inst_path="fc.bin",

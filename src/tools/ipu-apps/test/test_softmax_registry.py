@@ -1,4 +1,4 @@
-"""Tests for the softmax app router (``ipu_apps.softmax.lookup``).
+"""Tests for the softmax app router (``ipu_apps.kernels.softmax.lookup``).
 
 The router's whole value is that its answers match reality, so the tests are
 mostly consistency checks against the apps themselves rather than assertions
@@ -15,7 +15,7 @@ import importlib
 
 import pytest
 
-from ipu_apps.softmax import GAPS, catalog, lookup, lookup_torch
+from ipu_apps.kernels.softmax import GAPS, catalog, lookup, lookup_torch
 
 _CTOR_KWARGS = dict(inst_path="x", input_path="y", output_path=None)
 

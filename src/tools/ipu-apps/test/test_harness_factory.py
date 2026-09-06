@@ -172,7 +172,7 @@ def test_explicit_state_bypasses_execution_selector(monkeypatch):
 
 def test_unregistered_harness_defaults_and_direct_subclass(monkeypatch, tmp_path):
     import ipu_apps.kernel_registry.registry as registry
-    from ipu_apps.kernel_registry.identity import IdentityApp
+    from ipu_apps.kernels.identity import IdentityApp
 
     def forbidden(*args, **kwargs):
         pytest.fail("direct construction must not scan the registry")
@@ -245,11 +245,11 @@ def test_missing_case_declaration_is_actionable(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         main(["--kernel", "identity"])
     assert exc.value.code == 1
-    assert "cannot load CASES from ipu_apps.kernel_registry.identity.cases" in capsys.readouterr().err
+    assert "cannot load CASES from ipu_apps.kernels.identity.cases" in capsys.readouterr().err
 
 
 def test_failed_output_is_exported_with_diagnostics(tmp_path, monkeypatch, capsys):
-    from ipu_apps.kernel_registry.identity import IdentityApp
+    from ipu_apps.kernels.identity import IdentityApp
 
     monkeypatch.setattr(IdentityApp, "teardown", lambda app, state: app.output_path.write_bytes(b"bad"))
     out = tmp_path / "failed.bin"
@@ -302,7 +302,7 @@ if 'pytest' in sys.modules:
 
 
 def test_fc_dtype_default_and_normalization():
-    from ipu_apps.fully_connected import FullyConnectedApp
+    from ipu_apps.kernels.fully_connected import FullyConnectedApp
     from ipu_emu.ipu_math import DType
 
     verdict = resolve("fully_connected", shape=(10, 128))
@@ -323,17 +323,17 @@ def test_cases_and_assembly_follow_package_not_class_module(tmp_path, monkeypatc
     package = tmp_path / "split_kernel"
     package.mkdir()
     (package / "app.py").write_text(
-        "from ipu_apps.kernel_registry.identity import IdentityApp\n"
+        "from ipu_apps.kernels.identity import IdentityApp\n"
         "class SplitApp(IdentityApp): pass\n"
     )
     (package / "__init__.py").write_text(
         "from dataclasses import replace\n"
-        "from ipu_apps.kernel_registry.identity import SPEC as BASE\n"
+        "from ipu_apps.kernels.identity import SPEC as BASE\n"
         "from .app import SplitApp\n"
         "SPEC = replace(BASE, name='split_identity', app_class=SplitApp, asm='copy.asm')\n"
     )
-    (package / "cases.py").write_text("from ipu_apps.kernel_registry.identity.cases import CASES\n")
-    (package / "copy.asm").write_text(files("ipu_apps.kernel_registry.identity").joinpath("identity.asm").read_text())
+    (package / "cases.py").write_text("from ipu_apps.kernels.identity.cases import CASES\n")
+    (package / "copy.asm").write_text(files("ipu_apps.kernels.identity").joinpath("identity.asm").read_text())
     monkeypatch.syspath_prepend(str(tmp_path))
     spec = import_module("split_kernel").SPEC
     monkeypatch.setattr(registry, "kernel_spec", lambda *_, **__: spec)
@@ -361,7 +361,7 @@ def test_pytest_config_collects_adjacent_suites(tmp_path):
 
 
 def test_softmax_case_width_must_be_declared():
-    from ipu_apps.softmax.test_support import random_case
+    from ipu_apps.kernels.softmax.test_support import random_case
     with pytest.raises(ValueError, match="width"):
         random_case(axis=0, defaults={"widht": 10}, max_cycles=100)
 

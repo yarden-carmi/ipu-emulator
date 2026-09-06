@@ -22,7 +22,7 @@ from ipu_as.lark_tree import assemble_to_bin_file
 
 import ipu_apps.kernel_registry.registry as registry
 from ipu_apps.kernel_registry.layers import _ADAPTERS
-from ipu_apps.kernel_registry.pooling.maxpool2d_stride2.test import (
+from ipu_apps.kernels.pooling.maxpool2d_stride2.test import (
     assert_maxpool2d_stride2_kernel,
 )
 from ipu_apps.kernel_registry.cases import load_cases, run_case
@@ -85,7 +85,7 @@ def test_discovery_reports_nothing_skipped():
 def test_discovery_is_recursive():
     """Kernels sit one level below `softmax`, and the convolution family nests
     three levels deep, so discovery must not stop at the first level."""
-    found = discover("ipu_apps.softmax")
+    found = discover("ipu_apps.kernels.softmax")
     assert {k.name for k in found.specs} == {k.name for k in kernels("softmax")}
 
 

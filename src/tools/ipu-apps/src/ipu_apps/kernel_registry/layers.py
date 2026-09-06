@@ -16,7 +16,7 @@ torch an optional dependency: the registry never imports it. Anything exposing
 the right attributes works, including a stub in a test.
 
 This module holds only the *mechanism*. Every adapter lives beside the kernels
-it serves (softmax's are in :mod:`ipu_apps.softmax._spec_support`), so no
+it serves (softmax's are in :mod:`ipu_apps.kernels.softmax._spec_support`), so no
 operation's vocabulary leaks into the op-agnostic core, and supporting a new
 layer type never touches this file. :func:`from_layer` runs discovery before
 looking an adapter up, because a kernel package that has not been imported has

@@ -65,8 +65,8 @@ so the guard and the router cannot disagree.
 `discover()` walks the `ipu_apps` package tree and collects every `SPEC`. Two
 properties matter:
 
-- **Arbitrary depth.** Softmax nests kernels one level down; the convolution
-  family nests them three (`convolutions_universal/conv/conv1x1/`).
+- **Arbitrary depth.** Softmax nests kernels under `kernels/softmax/`; the convolution
+  family nests them deeper (`kernels/convolutions/conv/conv1x1/`).
 - **Tolerance of broken packages.** A working tree routinely contains modules
   that will not import — a kernel mid-authoring, a stale directory left by a
   branch switch, an uninstalled optional dependency. Those are recorded as
@@ -131,7 +131,7 @@ Adapters are matched on the layer's **class name**, so the registry never
 imports torch and torch stays an optional dependency.
 
 Every adapter lives beside the kernels it serves — softmax's are in
-`ipu_apps/softmax/_spec_support.py`, not in the registry core — so no
+`ipu_apps/kernels/softmax/_spec_support.py`, not in the registry core — so no
 operation's vocabulary leaks into the op-agnostic layer. They register as an
 import side effect of that package, which is why `from_layer` runs discovery
 before looking one up: an adapter in a package nothing has imported yet has not

@@ -8,7 +8,7 @@ Adding an application is **purely additive**: you create files inside your own
 app package and touch no central routing logic.
 
 The smallest complete reference is
-`src/tools/ipu-apps/src/ipu_apps/kernel_registry/identity/`: its assembly
+`src/tools/ipu-apps/src/ipu_apps/kernels/identity/`: its assembly
 kernel copies an FP32 matrix, while its Python harness only loads the input
 memory, configures the run, and reads the output memory.
 
@@ -16,15 +16,15 @@ memory, configures the run, and reads the output memory.
 
 | # | Item | Where |
 |---|---|---|
-| 1 | The `.asm` kernel | `src/ipu_apps/<family>/<app>/<app>.asm` |
-| 2 | An `IpuApp` harness | `src/ipu_apps/<family>/<app>/__init__.py` |
+| 1 | The `.asm` kernel | `src/ipu_apps/kernels/<family>/<app>/<app>.asm` |
+| 2 | An `IpuApp` harness | `src/ipu_apps/kernels/<family>/<app>/__init__.py` |
 | 3 | A `KernelSpec` named `SPEC` | same `__init__.py`, at the bottom |
 | 4 | Runtime cases and pytest tests | Adjacent `cases.py` and `test.py` |
 | 5 | One `ipu_app` declaration | `src/tools/ipu-apps/BUILD.bazel` |
 
 Nesting depth is free — discovery recurses, so
-`convolutions_universal/conv/conv1x1/` works exactly like
-`softmax/softmax_rows/`.
+`kernels/convolutions/conv/conv1x1/` works exactly like
+`kernels/softmax/softmax_rows/`.
 
 ## 1. The harness
 
@@ -231,8 +231,8 @@ case suite part of CI. See the standard contract below.
 ## Checking your work
 
 ```bash
-python -m ipu_apps.softmax --catalog          # coverage table
-python -m ipu_apps.softmax --shape 32,300 --dim 1
+python -m ipu_apps.kernels.softmax --catalog          # coverage table
+python -m ipu_apps.kernels.softmax --shape 32,300 --dim 1
 ```
 
 ```python

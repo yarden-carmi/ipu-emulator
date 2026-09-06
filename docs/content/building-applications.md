@@ -1,6 +1,6 @@
 # Building IPU Applications
 
-This guide shows how to build a complete IPU application using the fully connected neural network layer as an example. The complete code is in [src/tools/ipu-apps/src/ipu_apps/fully_connected](https://github.com/rechefe/ipu-emulator/tree/master/src/tools/ipu-apps/src/ipu_apps/fully_connected).
+This guide shows how to build a complete IPU application using the fully connected neural network layer as an example. The complete code is in [src/tools/ipu-apps/src/ipu_apps/kernels/fully_connected](https://github.com/rechefe/ipu-emulator/tree/master/src/tools/ipu-apps/src/ipu_apps/kernels/fully_connected).
 
 ## Application Structure
 
@@ -526,4 +526,4 @@ coverage. Kernel packages do not need a custom `__main__.py`.
 - **Emulator Run**: The emulator executes instructions until the program counter exceeds instruction memory
 - **Bazel Integration**: `ipu_app` supplies a single label for run and test; `assemble_asm` remains available for standalone binary artifacts
 
-See the [Assembly Syntax Guide](assembly-syntax.md) for more details on writing IPU programs and the complete fully_connected example at `src/tools/ipu-apps/src/ipu_apps/fully_connected/` for a real-world implementation.
+See the [Assembly Syntax Guide](assembly-syntax.md) for more details on writing IPU programs and the complete fully_connected example at `src/tools/ipu-apps/src/ipu_apps/kernels/fully_connected/` for a real-world implementation.

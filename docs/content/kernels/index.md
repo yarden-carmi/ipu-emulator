@@ -27,8 +27,8 @@ Rather than reading each kernel's docstring, ask the registry. It answers from
 the kernels themselves, so it cannot drift out of date:
 
 ```bash
-python -m ipu_apps.softmax --shape 32,300 --dim 1
-python -m ipu_apps.softmax --catalog
+python -m ipu_apps.kernels.softmax --shape 32,300 --dim 1
+python -m ipu_apps.kernels.softmax --catalog
 ```
 
 ```python

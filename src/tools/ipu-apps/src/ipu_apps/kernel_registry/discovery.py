@@ -7,9 +7,9 @@ registration list to edit, no import to remember.
 
 Two properties this has to hold:
 
-* **Arbitrary depth.** ``softmax`` nests kernels one level down, but the
-  convolution family nests them three (``convolutions_universal/conv/
-  conv_universal/``). Recursion is not optional.
+* **Arbitrary depth.** ``kernels/softmax`` nests kernels two levels down, but the
+  convolution family nests them deeper (``kernels/convolutions/conv/
+  conv1x1/``). Recursion is not optional.
 * **Tolerance of broken or half-present packages.** A working tree can easily
   contain directories that are not importable -- stale ``__pycache__`` shells
   left behind by a branch switch, a kernel mid-authoring, an optional
@@ -72,7 +72,7 @@ def discover(package: str = "ipu_apps") -> Discovered:
 
     Args:
         package: Root package to walk. Defaults to the whole app tree; pass a
-            subpackage (``"ipu_apps.softmax"``) to scope discovery.
+            subpackage (``"ipu_apps.kernels.softmax"``) to scope discovery.
 
     Returns:
         A :class:`Discovered` holding the specs found and the modules skipped.
