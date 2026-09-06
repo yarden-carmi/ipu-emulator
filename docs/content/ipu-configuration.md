@@ -55,6 +55,9 @@ is no implicit default, every instruction must name a CR register explicitly
 (any `CR0`-`CR15`). Configure writable `CR2`-`CR15` from Python before running
 the program. `CR0` and `CR1` may be selected as dstructure operands, but retain
 their hard-wired raw values `0` and `1`:
+(any `CR0`-`CR15`). Configure writable `CR2`-`CR15` from Python before running
+the program. `CR0` and `CR1` may be selected as dstructure operands, but retain
+their hard-wired raw values `0` and `1`:
 
 ```python
 state.set_cr_dstructure(valid_elements=64, partition=0)
@@ -66,8 +69,14 @@ partition = config.partition
 # Configure and read a different dstructure CR.
 state.set_cr_dstructure(valid_elements=32, partition=4, cr_idx=3)
 config3 = state.get_dstructure_for(3)
+
+# Configure and read a different dstructure CR.
+state.set_cr_dstructure(valid_elements=32, partition=4, cr_idx=3)
+config3 = state.get_dstructure_for(3)
 ```
 
+When `cr_idx` is omitted, `set_cr_dstructure` writes `CR15`. The emulator
+defaults `CR15` to `valid_elements=128` and `partition=0`.
 When `cr_idx` is omitted, `set_cr_dstructure` writes `CR15`. The emulator
 defaults `CR15` to `valid_elements=128` and `partition=0`.
 Activation clamps the active element count to the available 128 elements at execution

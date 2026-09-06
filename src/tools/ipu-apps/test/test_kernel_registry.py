@@ -99,6 +99,11 @@ def test_registry_maxpool2d_stride2_loads_runs_and_reads_memory():
     assert_maxpool2d_stride2_kernel(_APP_SRC)
 
 
+def test_registry_identity_example_loads_runs_and_reads_memory():
+    """The built-in boilerplate is executable, not only a discoverable spec."""
+    assert_identity_kernel(_APP_SRC)
+
+
 def test_every_spec_is_well_formed():
     for spec in kernels():
         assert spec.name and spec.op, spec
