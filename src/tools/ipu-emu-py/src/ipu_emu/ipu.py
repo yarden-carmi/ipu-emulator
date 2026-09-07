@@ -100,9 +100,8 @@ XMEM_ADDRESSABLE_ROWS = XMEM_SIZE_BYTES // (LANES * _WIDE_ELEMENT_WIDTH_BYTES)
 # must land exactly on a slot boundary — no implicit wraparound.
 R_CYCLIC_VALID_INDICES = tuple(range(0, R_CYCLIC_SIZE, R_REG_SIZE))
 
-# XMEM is allocated 8 MB always (mode-independent); narrow mode may address
-# only the first 2 MB of it (16384 rows of 128 B). Debug mode reaches the
-# full 8 MB (16384 rows of 512 B).
+# Both modes use the same row-count limit, derived from the wide row size.
+# Wide mode reaches the full allocation; narrow's 128-byte rows reach a quarter.
 NARROW_MAX_ROW = XMEM_ADDRESSABLE_ROWS
 
 # 0..LANES-1, for the rotated Ra window MULT.VE reads.
@@ -481,20 +480,20 @@ class Ipu:
         ``.asm`` XMEM operands (``offset + base``) are row numbers, not byte
         addresses — one row is LANES elements, so the same row number reaches
         the same logical row in both modes at different byte offsets. XMEM is
-        allocated 8 MB unconditionally; narrow mode may only *address* the
-        first 16384 rows (the first 2 MB) of that allocation.
+        allocated independently of the mode; narrow mode may only *address*
+        NARROW_MAX_ROW rows (a quarter of the allocation in bytes).
 
         This only translates and range-checks the row itself; the resulting
         address's actual payload (which may span more than one row's worth of
         bytes, e.g. STR_ACC_REG's fixed 512-byte R_ACC) is bounds-checked by
-        ``XMem.read_address``/``write_address`` against the 8 MB allocation.
+        ``XMem.read_address``/``write_address`` against XMEM_SIZE_BYTES.
         """
         if row < 0:
             raise EmulatorError(f"XMEM row must be non-negative; got {row}")
         if not self._wide_vector_active() and row >= NARROW_MAX_ROW:
             raise EmulatorError(
                 f"XMEM row {row} is out of range for narrow mode "
-                f"(rows 0..{NARROW_MAX_ROW - 1}, the first 2 MB of the 8 MB allocation)"
+                f"(rows 0..{NARROW_MAX_ROW - 1}, {NARROW_MAX_ROW * LANES} addressable bytes)"
             )
         addr = row * self._row_size_bytes()
         if addr >= XMEM_SIZE_BYTES:

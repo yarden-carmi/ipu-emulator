@@ -28,7 +28,7 @@ All kernels here run in **wide-vector FP32 debug mode**
 | 14 | `convDa` (3×3 + ReLU) | [`conv3x3_relu`](conv2d.md) |
 | 15 | `convDb` (1×1 → 256) | [`conv1x1`](conv2d.md) |
 | 16 | dense descriptor L2 normalize | [`l2_normalize_channels`](normalize.md) |
-| 17 | `sample_descriptors` (grid_sample) | host — needs a gather |
+| 17 | dense integer-pixel descriptor interpolation | [`sample_descriptors_separable`](sample-descriptors.md) for stock; `sample_descriptors` for shared/direct |
 | 18 | per-keypoint L2 normalize | [`l2_normalize_channels`](normalize.md) |
 
 Operation 6 needs no kernel of its own: a softmax over the channel axis of a
@@ -50,7 +50,7 @@ express, and saying so plainly is more useful than an empty row.
 |---|---|
 | `simple_nms`'s `==` / `\|` / `where` | no vector compare and no boolean vector. The **pool** is `maxpool2d_window`; the local-max test and the two suppression rounds around it are host work |
 | the top-k τ bisection | the device emits `Σ sigmoid(T(s−τ))`; comparing it to `k` and bisecting is a host loop that re-launches the kernel |
-| `sample_descriptors` / `grid_sample` | a gather at data-dependent coordinates; the ISA has no gather |
+| sparse / arbitrary-coordinate `grid_sample` | data-dependent gathers remain host work; [`sample_descriptors`](sample-descriptors.md) computes every integer pixel using precomputed spatial filters |
 | dustbin slice, border removal, `(h,w)→(x,y)` | data movement, no compute |
 
 Two of these are **behavioural** rather than exact, and it is worth being
@@ -59,8 +59,10 @@ precise about which:
 - **the top-k cap** keeps *about* `k` keypoints, not exactly `k` — the threshold
   is calibrated, not sorted. Everything up to and including the threshold gate
   is exact; only the cap approximates.
-- nothing else. The convolutions and the L2 norm differ from a stock PyTorch
-  run only by FP32 accumulation order.
+- descriptor interpolation's `shared` mode uses cell-centered coordinates;
+  `stock` mode reproduces the checked-in sampler's interpolation coordinates.
+  Neither includes the final descriptor L2 normalization. The convolutions
+  and the L2 norm differ from a stock PyTorch run only by FP32 accumulation order.
 
 ## Two limits that turned out not to hold
 
@@ -77,21 +79,15 @@ as permanently host-side. The current ISA expresses both:
 
 ## What fits XMEM, and what does not
 
-Wide-vector XMEM holds 16384 rows of 512 B. At full 480×640 resolution:
+Wide-vector XMEM now holds 1,048,576 rows of 512 B (512 MiB). At full
+480×640 resolution, the dense descriptor kernel fits in one launch: its
+stock separable layout is approximately 305.7 MiB, including 300 MiB of output.
+The original direct stock implementation remains available and uses 326.1 MiB.
 
-| Operation | Fits in one launch? |
-|---|---|
-| every convolution | **no** — must be tiled into row bands |
-| `maxpool2d_stride2` on a 64-channel map | **no** — must be banded |
-| `maxpool2d_nms9` on the single-plane score map | **yes** — 2928 + 2880 rows |
-| `depth_to_space` (60×80×64 → 480×640) | **yes** — 3840 + 3840 rows |
-| `score_threshold` on the 480×640 map | **yes** |
-
-The difference is the channel count, not the resolution: the detector head's
-post-processing runs on one plane, the network body on 64 to 256.
-
-Every refusal reports the per-region row arithmetic and the largest row band
-that would fit, so a caller learns how to tile rather than only that it failed.
+The earlier 8 MiB capacity assumptions no longer apply. Use each kernel's
+memory-layout guard to check its complete input, padding, weights, scratch,
+and output requirements. Larger maps that exceed the current capacity still
+require tiling by their caller.
 
 ## Not ported
 

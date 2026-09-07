@@ -78,6 +78,7 @@ nav:
       - Normalization: kernels/normalize.md
       - Reshape: kernels/reshape.md
       - Detector head: kernels/detect.md
+      - Descriptor interpolation: kernels/sample-descriptors.md
       - SuperPoint layer map: kernels/superpoint.md
       - Application Coverage: app-coverage.md
       - Adding Applications: adding-applications.md

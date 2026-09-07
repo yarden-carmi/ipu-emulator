@@ -59,11 +59,12 @@ ipu_app(
         kernel_package = kernel_package,
         deps = [":ipu_apps_lib"],
         test_deps = [requirement("pytest")],
-        # The stride-2 package's shared test.py exercises both assembly files.
+        # Shared tests may exercise sibling assembly variants in the package.
         data = glob(
-            ["src/ipu_apps/kernels/pooling/maxpool2d_stride2/*.asm"],
+            [kernel_package + "/*.asm"],
             exclude = [kernel_package + "/" + name + ".asm"],
-        ) if name.startswith("maxpool2d_stride2") else [],
+            allow_empty = True,
+        ),
     )
     for name, kernel_package in [
         ("conv1x1", "src/ipu_apps/kernels/convolutions/conv/conv1x1"),
@@ -76,6 +77,8 @@ ipu_app(
         ("maxpool2d_window", "src/ipu_apps/kernels/pooling/maxpool2d_window"),
         ("l2_normalize_channels", "src/ipu_apps/kernels/normalize/l2_normalize_channels"),
         ("depth_to_space", "src/ipu_apps/kernels/reshape/depth_to_space"),
+        ("sample_descriptors", "src/ipu_apps/kernels/sample_descriptors"),
+        ("sample_descriptors_separable", "src/ipu_apps/kernels/sample_descriptors"),
         ("maxpool2d_stride2", "src/ipu_apps/kernels/pooling/maxpool2d_stride2"),
         ("maxpool2d_stride2_tail", "src/ipu_apps/kernels/pooling/maxpool2d_stride2"),
     ]
