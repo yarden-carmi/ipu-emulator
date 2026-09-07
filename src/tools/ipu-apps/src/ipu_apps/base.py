@@ -17,6 +17,7 @@ Subclass :class:`IpuApp`, implement :meth:`setup` (and optionally
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,7 @@ class IpuApp:
         inst_path:   Path to the assembled instruction binary.
         output_path: Optional path to write output data.
         **kwargs:    Any extra fields are stored as attributes (for example
-            ``elu_alpha`` for :meth:`run`).
+            ``elu_alpha``, ``window_a`` or ``window_b`` for :meth:`run`).
     """
 
     def __init__(
@@ -52,6 +53,12 @@ class IpuApp:
         for key, value in kwargs.items():
             setattr(self, key, value)
 
+    def make_state(self) -> "IpuState":
+        """Create fresh state using this harness's registry execution config."""
+        from ipu_apps.kernel_registry.registry import create_state
+
+        return create_state(self)
+
     def setup(self, state: "IpuState") -> None:
         """Prepare the IPU state before execution. Override this."""
 
@@ -65,22 +72,48 @@ class IpuApp:
         debug_callback: DebugCallback | None = None,
         state: "IpuState | None" = None,
         elu_alpha: float | None = None,
+        window_a: float | None = None,
+        window_b: float | None = None,
     ) -> tuple["IpuState", int]:
         """Run the app end-to-end. Returns ``(state, cycles)``.
 
-        Optional ``elu_alpha`` matches :func:`ipu_emu.emulator.run_test`: it
-        configures emulator-only activation α (not CR). An explicit argument wins;
-        otherwise an ``elu_alpha`` attribute stored on the app from
-        ``__init__(**kwargs)`` (for example ``MyApp(..., elu_alpha=0.5)``) is used
-        when present.
+        Optional ``elu_alpha``, ``window_a`` and ``window_b`` match
+        :func:`ipu_emu.emulator.run_test`: they configure emulator-only activation
+        parameters (not CR) — α for ``elu`` and the ``[a, b)`` bounds of ``window``.
+        An explicit argument wins; otherwise an attribute of the same name stored on
+        the app from ``__init__(**kwargs)`` (for example ``MyApp(..., elu_alpha=0.5)``)
+        is used when present.
         """
         ea = elu_alpha if elu_alpha is not None else getattr(self, "elu_alpha", None)
-        return run_test(
-            inst_path=self.inst_path,
-            setup=self.setup,
-            teardown=self.teardown,
-            max_cycles=max_cycles,
-            debug_callback=debug_callback,
-            state=state,
-            elu_alpha=ea,
+        wa = window_a if window_a is not None else getattr(self, "window_a", None)
+        wb = window_b if window_b is not None else getattr(self, "window_b", None)
+        debug_launch = os.environ.get("IPU_DEBUG_TUI") == "1"
+        if debug_launch:
+            from ipu_emu.debug_launch import make_tui_debug_callback
+
+            from ipu_apps.kernel_registry.registry import _harness_spec
+
+            spec = _harness_spec(self)
+            debug_callback = make_tui_debug_callback(
+                spec.name if spec is not None else type(self).__name__
+            )
+        try:
+            return run_test(
+                inst_path=self.inst_path,
+                setup=self.setup,
+                teardown=self.teardown,
+                max_cycles=max_cycles,
+                debug_callback=debug_callback,
+                break_on_entry=debug_launch,
+                state=state if state is not None else self.make_state(),
+                elu_alpha=ea,
+                window_a=wa,
+                window_b=wb,
         )
+        except KeyboardInterrupt:
+            if debug_launch:
+                # F5 restores the terminal before resuming the emulator, so
+                # interrupts between stops must cancel outside curses too.
+                # Unwind case workspaces without checking incomplete output.
+                raise SystemExit(0) from None
+            raise

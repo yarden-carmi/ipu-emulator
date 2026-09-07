@@ -20,6 +20,7 @@ from ipu_emu.emulator import (
     DebugAction,
 )
 from ipu_emu.ipu_state import IpuState, INST_MEM_SIZE, WideVectorArithmetic
+from ipu_emu.debug_control import get_debug_control
 from ipu_emu.ipu_math import DType
 from ipu_emu.ipu_config import encode_dstructure, PadMode
 from ipu_emu.ipu import EmulatorError, NARROW_MAX_ROW
@@ -42,16 +43,18 @@ def _make_state(
     *,
     cr: dict[int, int] | None = None,
     elu_alpha: float | None = None,
+    window_a: float | None = None,
+    window_b: float | None = None,
 ) -> IpuState:
     """Assemble *asm_code* and return a ready-to-run IpuState.
 
     Optional *cr* presets configuration registers before the program is loaded
-    (e.g. constants read by ``SET lr* cr*``). Optional α kwargs are forwarded to
-    :class:`IpuState` (emulator-only; not CR).
+    (e.g. constants read by ``SET lr* cr*``). Optional α and window-bound kwargs
+    are forwarded to :class:`IpuState` (emulator-only; not CR).
     """
     encoded = assemble(asm_code)
     decoded = [decode_instruction_word(w) for w in encoded]
-    state = IpuState(elu_alpha=elu_alpha)
+    state = IpuState(elu_alpha=elu_alpha, window_a=window_a, window_b=window_b)
     if cr:
         for idx, val in cr.items():
             state.regfile.set_cr(idx, val)
@@ -64,6 +67,8 @@ def _run(
     *,
     cr: dict[int, int] | None = None,
     elu_alpha: float | None = None,
+    window_a: float | None = None,
+    window_b: float | None = None,
     max_cycles: int = 100_000,
 ) -> IpuState:
     """Assemble, load, run, and return the final state."""
@@ -71,6 +76,8 @@ def _run(
         asm_code,
         cr=cr,
         elu_alpha=elu_alpha,
+        window_a=window_a,
+        window_b=window_b,
     )
     run_until_complete(state, max_cycles)
     return state
@@ -1990,6 +1997,124 @@ BKPT;;
 # ============================================================================
 
 
+class TestDebuggerStops:
+    def test_step_stops_before_next_instruction_and_counts_completed_cycles(self):
+        state = _make_state("BREAK;;\nINC lr0 1;;\nINC lr0 1;;\nBKPT;;")
+        stops = []
+
+        def callback(state, cycle):
+            stops.append((state.program_counter, cycle, state.regfile.get_lr(0)))
+            return DebugAction.STEP
+
+        assert run_with_debug(state, callback) == 4
+        assert stops == [(0, 0, 0), (1, 1, 0), (2, 2, 1), (3, 3, 2)]
+        assert state.stats.total_cycles == 4
+
+    def test_runtime_breakpoint_rearms_on_loop_visit(self):
+        state = _make_state("loop:\nINC lr0 1;;\nBNE lr0 cr2 loop;;\nBKPT;;", cr={2: 3})
+        control = get_debug_control(state)
+        control.add_breakpoint(0)
+        original = [inst.copy() if inst else None for inst in state.inst_mem]
+        stops = []
+
+        def callback(state, cycle):
+            stops.append((state.program_counter, cycle, state.regfile.get_lr(0)))
+            assert control.stop_reason == "breakpoint"
+            return DebugAction.CONTINUE
+
+        assert run_with_debug(state, callback) == 7
+        assert stops == [(0, 0, 0), (0, 2, 1), (0, 4, 2)]
+        assert state.inst_mem == original
+
+    def test_simultaneous_causes_stop_once(self):
+        state = _make_state("BREAK;;\nBREAK;;\nBKPT;;")
+        control = get_debug_control(state)
+        control.add_breakpoint(1)
+        reasons = []
+
+        def callback(state, cycle):
+            reasons.append((state.program_counter, cycle, control.stop_reason))
+            if cycle == 0:
+                control.run_until(1, state.program_counter)
+                return DebugAction.STEP
+            return DebugAction.CONTINUE
+
+        assert run_with_debug(state, callback) == 3
+        assert reasons == [
+            (0, 0, "BREAK instruction"),
+            (1, 1, "breakpoint, run target, step, BREAK instruction"),
+        ]
+        assert control.run_target is None
+
+    def test_run_target_stops_before_side_effects(self):
+        state = _make_state("INC lr0 1;;\nINC lr0 1;;\nBKPT;;")
+        control = get_debug_control(state)
+        control.run_until(1, 0)
+        stops = []
+
+        def callback(state, cycle):
+            stops.append((state.program_counter, cycle, state.regfile.get_lr(0)))
+            assert control.run_target is None
+            assert control.stop_reason == "run target"
+            return DebugAction.QUIT
+
+        assert run_with_debug(state, callback) == 1
+        assert stops == [(1, 1, 1)]
+        assert state.stats.total_cycles == 1
+
+    def test_intervening_break_cancels_run_target(self):
+        state = _make_state("BREAK;;\nBREAK;;\nINC lr0 1;;\nBKPT;;")
+        control = get_debug_control(state)
+        stops = []
+
+        def callback(state, cycle):
+            stops.append(state.program_counter)
+            if cycle == 0:
+                control.run_until(2, state.program_counter)
+            else:
+                assert control.run_target is None
+            return DebugAction.CONTINUE
+
+        assert run_with_debug(state, callback) == 4
+        assert stops == [0, 1]
+        assert state.regfile.get_lr(0) == 1
+
+    @pytest.mark.parametrize("termination", ["halt", "quit", "limit", "error"])
+    def test_run_target_cleared_on_every_exit(self, termination):
+        state = _make_state("BREAK;;\nBKPT;;")
+        control = get_debug_control(state)
+
+        def callback(state, cycle):
+            control.run_until(10, state.program_counter)
+            if termination == "error":
+                raise ValueError("callback failed")
+            return DebugAction.QUIT if termination == "quit" else DebugAction.CONTINUE
+
+        if termination in ("limit", "error"):
+            with pytest.raises(RuntimeError if termination == "limit" else ValueError):
+                run_with_debug(state, callback, max_cycles=1)
+        else:
+            run_with_debug(state, callback)
+        assert control.run_target is None
+
+    def test_pc_and_register_edits_apply_to_resumed_instruction(self):
+        state = _make_state("BREAK;;\nSET lr1 cr2;;\nBKPT;;")
+
+        def callback(state, cycle):
+            state.program_counter = 1
+            state.regfile.set_cr(2, 19)
+            return DebugAction.STEP
+
+        stops = []
+
+        def edit_once(state, cycle):
+            stops.append((state.program_counter, cycle, state.regfile.get_lr(1)))
+            return callback(state, cycle) if cycle == 0 else DebugAction.QUIT
+
+        assert run_with_debug(state, edit_once) == 1
+        assert stops == [(0, 0, 0), (2, 1, 19)]
+
+
 class TestDecodeRoundtrip:
     def test_nop_decodes(self):
         """An all-NOP instruction should decode without error."""
@@ -2708,6 +2833,68 @@ BKPT;;
         run_until_complete(state)
         expected = max(-128, min(127, int(round(apply_activation(7, float(x), elu_alpha=alpha)))))
         assert state.regfile.get_post_aaq_reg()[0] == expected & 0xFF
+
+    def test_window_default_bounds(self):
+        """window with default bounds [0.0, 0.1): only x = 0 is inside."""
+        state = _make_state(
+            """\
+ACTIVATE.QUANTIZE window cr15;;
+BKPT;;
+"""
+        )
+        state.dtype = DType.INT8
+        state.set_cr_dstructure(4)
+        for i, x in enumerate((0, 1, -1, 7)):
+            state.regfile.set_r_acc_word(i, struct.unpack("<I", struct.pack("<i", x))[0])
+        run_until_complete(state)
+        result = state.regfile.get_post_aaq_reg()
+        assert result[0] == 1, "window(0) = 1 (lower bound is inclusive)"
+        assert result[1] == 0, "window(1) = 0 (above b = 0.1)"
+        assert result[2] == 0, "window(-1) = 0 (below a = 0.0)"
+        assert result[3] == 0, "window(7) = 0"
+
+    def test_window_respects_ipu_state_bounds(self):
+        """window with IpuState bounds is the half-open indicator on [a, b)."""
+        state = _make_state(
+            """\
+ACTIVATE.QUANTIZE window cr15;;
+BKPT;;
+""",
+            window_a=-3.0,
+            window_b=5.0,
+        )
+        state.dtype = DType.INT8
+        state.set_cr_dstructure(5)
+        for i, x in enumerate((-4, -3, 0, 4, 5)):
+            state.regfile.set_r_acc_word(i, struct.unpack("<I", struct.pack("<i", x))[0])
+        run_until_complete(state)
+        result = state.regfile.get_post_aaq_reg()
+        assert result[0] == 0, "window(-4) = 0 (below a)"
+        assert result[1] == 1, "window(-3) = 1 (a is inclusive)"
+        assert result[2] == 1, "window(0) = 1"
+        assert result[3] == 1, "window(4) = 1"
+        assert result[4] == 0, "window(5) = 0 (b is exclusive)"
+
+    def test_window_fractional_bounds(self):
+        """Fractional bounds select the integer elements that fall inside [a, b)."""
+        state = _make_state(
+            """\
+ACTIVATE.QUANTIZE window cr15;;
+BKPT;;
+""",
+            window_a=1.5,
+            window_b=3.5,
+        )
+        state.dtype = DType.INT8
+        state.set_cr_dstructure(4)
+        for i, x in enumerate((1, 2, 3, 4)):
+            state.regfile.set_r_acc_word(i, struct.unpack("<I", struct.pack("<i", x))[0])
+        run_until_complete(state)
+        result = state.regfile.get_post_aaq_reg()
+        assert result[0] == 0, "window(1) = 0 (below a = 1.5)"
+        assert result[1] == 1, "window(2) = 1"
+        assert result[2] == 1, "window(3) = 1"
+        assert result[3] == 0, "window(4) = 0 (above b = 3.5)"
 
     def test_r_acc_not_modified(self):
         """ACTIVATE.QUANTIZE does not modify r_acc."""
