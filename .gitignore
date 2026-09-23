@@ -30,6 +30,7 @@ bazel-testlogs/
 /vscode-ipu-asm/data/
 /vscode-ipu-asm/language-configuration.json
 /vscode-ipu-asm/node_modules/
+/vscode-ipu-asm/.vscode-test/
 /vscode-ipu-asm/*.vsix
 /parser-tokens.json
 
