@@ -19,7 +19,7 @@
 \usepackage{caption}
 \usepackage{amssymb}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta,fit,backgrounds}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc}
 \usepackage{multicol}
 \usepackage{tocloft}
 \usepackage{needspace}
@@ -127,6 +127,13 @@
   left=8pt, right=8pt, top=4pt, bottom=4pt}
 \newtcolorbox{note}{enhanced, breakable, colback=notebg, colframe=accent,
   boxrule=0pt, leftrule=3pt, arc=0pt, left=8pt, right=8pt, top=4pt, bottom=4pt}
+\definecolor{openbg}{HTML}{FFF8E5}
+\definecolor{openframe}{HTML}{BF8700}
+% A point where the hardware specification and the emulator disagree, or the
+% specification is not final. The text around it describes the emulator.
+\newtcolorbox{openq}{enhanced, breakable, colback=openbg, colframe=openframe,
+  boxrule=0pt, leftrule=3pt, arc=0pt, left=8pt, right=8pt, top=4pt, bottom=4pt,
+  fontupper=\small, before upper={\textbf{\sffamily Open hardware question.}\ }}
 
 \newcommand{\terminal}[3][0.75]{%
   \begin{figure}[H]\centering
@@ -162,7 +169,7 @@
 \newpage
 
 %======================================================================
-\section{What the IPU emulator is for}
+\section{Kernels}
 
 The IPU is a vector processor for neural-network inference. It runs
 \textbf{kernels}.
@@ -238,7 +245,7 @@ Conv $3\times3$ & \texttt{conv\_universal} \\
 \end{center}
 
 %======================================================================
-\section{The IPU architecture}
+\section{The IPU architecture}\label{sec:arch}
 
 Hardware specifications: \doc{specs/stage-control}{control stage},
 \doc{specs/stage-accumulator}{accumulator stage}, \doc{specs/stage-aaq-str}{AAQ and store stages},
@@ -308,7 +315,17 @@ Hardware specifications: \doc{specs/stage-control}{control stage},
 \subsection{Memory}
 
 \textbf{XMEM} is the external memory. Assembly addresses it in \emph{rows} of
-128 elements.
+128 elements; a load reads one row, a store writes one row.
+
+\begin{itemize}
+\item \textbf{Elements.} In hardware, stored as 8-bit values plus a per-row
+  scale; loads and stores convert to and from 32 bits.
+\item \textbf{Addresses.} Row \texttt{CR + LR}: the host sets the base CR, the
+  kernel steps the offset LR.
+\item \textbf{Banks.} 16 banks of 1024 rows, filled from DRAM by DMA
+  (\doc{specs/cache-unit}{cache unit}). Accessing a bank before DMA has filled
+  all of it stalls the IPU.
+\end{itemize}
 
 \needspace{7cm}
 \subsection{Registers}
@@ -326,11 +343,17 @@ Register & Holds & Role \\
 \texttt{MULT\_RES} & 128 $\times$ 32-bit & result of the multiply stage \\
 \texttt{R\_ACC} & 128 $\times$ 32-bit & accumulator \\
 \texttt{POST\_AAQ\_REG} & 128 $\times$ 32-bit & activated result \\
-\texttt{LR0}--\texttt{LR15} & 16 $\times$ 32-bit & loop registers, changed by the program \\
-\texttt{CR0}--\texttt{CR15} & 16 $\times$ 32-bit & control registers, set before the run \\
+\texttt{LR0}--\texttt{LR15} & 16 $\times$ 32-bit & loop registers, written only by
+the program \\
+\texttt{CR0}--\texttt{CR15} & 16 $\times$ 32-bit & control registers, written by the
+host before the run; read-only to the program \\
 \bottomrule
 \end{tabularx}
 \end{center}
+
+A \textbf{dstructure} CR holds \texttt{valid\_elements}, \texttt{partition}
+and \texttt{pad\_mode} (section~\ref{sec:masks}); conventionally \texttt{CR15},
+but each instruction names its own.
 
 \subsection{Instruction words and slots}
 
@@ -356,8 +379,7 @@ Slot & Does & Instructions \\
 \end{tabularx}
 \end{center}
 
-A \texttt{.FIRST} variant starts a new sum (or max) instead of adding to the
-previous one. Empty slots are filled with \texttt{NOP}.
+Empty slots are filled with \texttt{NOP}.
 The \doc{instructions}{Instruction Reference} documents every instruction, and
 \doc{assembly-syntax}{Assembly Syntax} the full syntax.
 
@@ -379,11 +401,250 @@ row_loop:
 
 Each \texttt{;;} ends an instruction word, so this loop takes five cycles per
 row. Faster kernels pack more work into each word --- for example loading the
-next row in the same word that multiplies the current one.
+next row in the same word that multiplies the current one
+(section~\ref{sec:onerow}).
 
-\subsection{Read timing within a word}
+\subsection{Instruction memory}
 
-The emulator runs the slots of a word in this order: the three \texttt{lr}
+Two banks of 128 words (\doc{specs/stage-control}{control stage}): the IPU
+runs from one while the host loads the other. Jinja template loops (section~\ref{sec:newkernel}) unroll at assembly, so
+each iteration costs words.
+
+%======================================================================
+\section{The instruction set}\label{sec:isa}
+
+Operands are separated by spaces. The \doc{instructions}{Instruction Reference}
+lists every encoding.
+
+\subsection{Rows and elements}
+
+XMEM operands count \textbf{rows}. Register operands count \textbf{elements}:
+\texttt{R\_CYCLIC} 0--511; \texttt{R0}:\texttt{R1} 0--255, with \texttt{R1}
+from 128.
+
+\subsection{Loads}
+
+One per word. \texttt{offset} and \texttt{index} are LRs, \texttt{base} a CR.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.43\linewidth}>{\raggedright\arraybackslash}X}
+\toprule
+Syntax & Effect \\
+\midrule
+\texttt{LDR\_MULT\_REG R0|R1 offset base} & row $\rightarrow$ \texttt{R0} or
+\texttt{R1} \\
+\texttt{LDR\_CYCLIC\_MULT\_REG offset base index} & row $\rightarrow$ ring
+elements \texttt{index} \ldots\ \texttt{index}+127; \texttt{index} holds 0, 128,
+256 or 384 \\
+\texttt{LDR\_MULT\_MASK\_REG offset base} & eight 128-bit lane masks from the
+start of the row $\rightarrow$ \texttt{R\_MASK} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Multiplies}
+
+One per word. Each form writes 128 products to \texttt{MULT\_RES}, then masks
+them (section~\ref{sec:masks}). Common operands: \texttt{m} mask number 0--7,
+\texttt{sh} LR holding the mask shift, \texttt{d} dstructure CR. \texttt{rc}
+and \texttt{ra} are LRs holding element numbers. RC is \texttt{R\_CYCLIC}, RA is
+\texttt{R0}:\texttt{R1}.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.36\linewidth}>{\raggedright\arraybackslash}X}
+\toprule
+Syntax & Lane $i$ of \texttt{MULT\_RES} \\
+\midrule
+\texttt{MULT.RC.VV rc R0|R1 m sh d} & $\mathrm{RC}[(rc+i) \bmod 512] \times
+\mathrm{R}[i]$ \\
+\texttt{MULT.RC.VE rc src m sh d} & $\mathrm{RC}[(rc+i) \bmod 512] \times s$ \\
+\texttt{MULT.RC.VS rc m sh d} & $\mathrm{RC}[(rc+i) \bmod 512]^2$ \\
+\texttt{MULT.VE ra cr m sh d} & $\mathrm{RA}[(ra+i) \bmod 256] \times
+\mathrm{CR}$ \\
+\texttt{MULT.EE ra cr m sh d} & $\mathrm{RA}[ra \bmod 256] \times \mathrm{CR}$,
+every lane \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{itemize}
+\item \textbf{Scalar $s$.} An LR \texttt{src} selects element
+  $\mathrm{RA}[\mathrm{LR}]$. A CR scalar is the CR's low byte as a signed
+  integer, $-128$ to $127$: \texttt{CR1} multiplies by 1.
+\item \textbf{Fractions.} $0.5$ or $\log_2 e$ go in a constant row, loaded into
+  \texttt{R0} or \texttt{R1} once and used with \texttt{MULT.RC.VV} or an LR
+  \texttt{src}.
+\end{itemize}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[
+  slot/.style={draw=accent, fill=accent!8, minimum height=9mm, minimum width=30mm,
+               font=\sffamily\scriptsize, align=center},
+  lab/.style={font=\sffamily\scriptsize, text=muted}]
+\foreach \i/\t in {0/row $k$, 1/row $k{+}1$, 2/row $k{+}2$ (loading), 3/free}
+  \node[slot] (s\i) at (\i*30mm, 0) {\t};
+\foreach \i/\a in {0/0, 1/128, 2/256, 3/384}
+  \node[lab, anchor=north west] at ($(s\i.south west)+(0,-0.5mm)$) {\a};
+\node[lab, anchor=north east] at ($(s3.south east)+(0,-0.5mm)$) {511};
+\fill[accent!45, opacity=0.6] ($(s0.north west)+(23.4mm,0)$) rectangle
+  ($(s1.south west)+(23.4mm,0)$);
+\foreach \i/\t in {0/row $k$, 1/row $k{+}1$}
+  \node[font=\sffamily\scriptsize, align=center] at (s\i) {\t};
+\draw[thick, accent] ($(s0.north west)+(23.4mm,2mm)$) -- ++(0,1.5mm) -|
+  ($(s1.north west)+(23.4mm,2mm)$);
+\node[lab, text=black, above] at ($(s0.north east)+(0,4mm)$)
+  {\texttt{MULT.RC.*} with $rc = 100$: elements 100--227};
+\draw[-{Stealth[length=2mm]}, thick] ($(s2.south)+(0,-5mm)$) -- (s2.south);
+\node[lab, text=black, below] at ($(s2.south)+(0,-5mm)$)
+  {\texttt{LDR\_CYCLIC\_MULT\_REG} with \texttt{index} = 256};
+\end{tikzpicture}
+\caption{\texttt{R\_CYCLIC}: loads fill whole slots, multiplies read any
+128-element window.}
+\end{figure}
+
+\subsection{Masks and partitions}\label{sec:masks}
+
+\begin{enumerate}
+\item \texttt{m} selects one of the eight masks in \texttt{R\_MASK}.
+\item The LR \texttt{sh} shifts the mask by $-3$ to $+3$ lanes. With
+  \texttt{partition} $P$ (2, 4, 8 or 16), the lanes form $P$ groups of $128/P$
+  and a shift stays inside each group: $+$ clears each group's first lane, $-$
+  its last. $P = 0$ is one group of 128.
+\item Lanes with a 0 bit take the \texttt{pad\_mode} value: 0, $+\infty$ or
+  $-\infty$ ($-\infty$ ahead of a max).
+\end{enumerate}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[
+  on/.style={draw=accent, fill=accent!35, minimum size=5mm, inner sep=0},
+  off/.style={draw=accent, fill=white, minimum size=5mm, inner sep=0},
+  lab/.style={font=\sffamily\scriptsize, anchor=east}]
+\newcommand{\lanes}[3]{% y, label, list of 16 bits
+  \node[lab] at (-2mm, #1) {#2};
+  \foreach \b [count=\i from 0] in {#3} {
+    \pgfmathsetmacro{\x}{\i*5.5 + (\i>7 ? 4 : 0)}
+    \ifnum\b=1 \node[on] at (\x mm, #1) {}; \else \node[off] at (\x mm, #1) {}; \fi
+  }}
+\lanes{0}{mask}{1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
+\lanes{-7mm}{\texttt{sh} $= +1$}{0,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1}
+\lanes{-14mm}{\texttt{sh} $= -1$}{1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,0}
+\node[font=\sffamily\scriptsize, text=muted, above] at (19.25mm, 3mm) {group 0};
+\node[font=\sffamily\scriptsize, text=muted, above] at (67.25mm, 3mm) {group 1};
+\end{tikzpicture}
+\caption{Mask shift inside partition groups (8 lanes per group drawn). In a
+$3\times3$ convolution with one image row per group, $\pm 1$ clears the edge
+column.}
+\end{figure}
+
+\texttt{valid\_elements} sets the lanes \texttt{AGG} reduces and
+\texttt{ACTIVATE.QUANTIZE} writes. A multiply costs one word whatever its mask.
+
+\needspace{6cm}
+\subsection{Accumulator}
+
+One per word. One \texttt{R\_ACC}: one output row at a time.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.36\linewidth}>{\raggedright\arraybackslash}X}
+\toprule
+Syntax & Effect \\
+\midrule
+\texttt{ACC.ADD}, \texttt{ACC.SUB}, \texttt{ACC.MAX} & per lane:
+\texttt{R\_ACC} op \texttt{MULT\_RES} \\
+\texttt{\ldots .FIRST} & \texttt{R\_ACC} $\leftarrow$ \texttt{MULT\_RES}
+($-$\texttt{MULT\_RES} for \texttt{SUB}); starts a new result \\
+\texttt{AGG.SUM LRd d}, \texttt{AGG.MAX LRd d} & sum or max of lanes 0 \ldots\
+\texttt{valid\_elements}$-1$, into \texttt{R\_ACC[LRd mod 128]};
+\texttt{.FIRST} overwrites, otherwise accumulates \\
+\texttt{ACC.STRIDE w h v LR} & \texttt{MULT\_RES} as rows of \texttt{w} = 16, 32
+or 64; \texttt{h}/\texttt{v}: \texttt{off}, \texttt{on} (even columns/rows),
+\texttt{on\_inv} (odd); result into \texttt{R\_ACC} from lane
+$(\mathrm{LR} \bmod 4) \times 32$ \\
+\texttt{ACC.RESHAPE LRDs LRDd m} & for $j = m \ldots 7$:
+\texttt{R\_ACC}$[d_j] \leftarrow$ \texttt{MULT\_RES}$[s_j]$; $s_j$, $d_j$ are
+the bytes of the two pairs \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Activation and store}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.43\linewidth}>{\raggedright\arraybackslash}X}
+\toprule
+Syntax & Effect \\
+\midrule
+\texttt{ACTIVATE.QUANTIZE fn d} & $f(\texttt{R\_ACC}[i]) \rightarrow$
+\texttt{POST\_AAQ\_REG}, lanes 0 \ldots\ \texttt{valid\_elements}$-1$ \\
+\texttt{STR\_POST\_AAQ\_REG offset base} & \texttt{POST\_AAQ\_REG}
+$\rightarrow$ row \texttt{base + offset} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\texttt{fn}: \texttt{identity}, \texttt{relu}, \texttt{relu6},
+\texttt{sigmoid}, \texttt{tanh}, \texttt{gelu}, \texttt{softplus},
+\texttt{elu}, \texttt{exp2}, \texttt{reciprocal}, \texttt{rsqrt},
+\texttt{silu}, \texttt{window}.
+
+\needspace{6\baselineskip}
+\begin{itemize}
+\item $e^x = \mathtt{exp2}(x \log_2 e)$: multiply by $\log_2 e$, then
+  \texttt{exp2}.
+\item \texttt{reciprocal}: softmax's $1/\mathrm{sum}$. \texttt{rsqrt}: layer
+  norm's $1/\sigma$.
+\item Stored lanes from \texttt{valid\_elements} on are undefined.
+\end{itemize}
+
+\begin{openq}
+The AAQ specification has \texttt{ACTIVATE.QUANTIZE} write XMEM itself, with no
+\texttt{STR\_POST\_AAQ\_REG}.
+\end{openq}
+
+\subsection{LR arithmetic}
+
+Three per word; 32-bit, wrapping.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.36\linewidth}>{\raggedright\arraybackslash}X}
+\toprule
+Syntax & Effect \\
+\midrule
+\texttt{SET LRd CR} & \texttt{LRd} $\leftarrow$ \texttt{CR} \\
+\texttt{ADD LRd LRa LR|CR}, \texttt{SUB \ldots} & \texttt{LRd} $\leftarrow$
+\texttt{LRa} $\pm$ operand \\
+\texttt{INC LRd n}, \texttt{DEC LRd n} & \texttt{LRd} $\leftarrow$
+\texttt{LRd} $\pm n$, $n$ = 0--255 \\
+\texttt{INCR\_MOD\_POW2 LRd LR|CR k} & \texttt{LRd} $\leftarrow$
+$(\texttt{LRd} + \mathrm{step}) \bmod 2^k$, $k$ = 1--9 ($k = 9$: ring pointer) \\
+\texttt{ADDB LRDn LR|CR}, \texttt{ADDBI LRDn b} & signed byte added to all eight
+bytes of \texttt{LRD}$n$ = \texttt{LR}$n{+}1$:\texttt{LR}$n$, clamped to 0--255 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{itemize}
+\item One write per LR per word; a pair counts as both registers.
+\item Constants come from CRs, products included: compute them on the host.
+\end{itemize}
+
+\subsection{Branches}
+
+One per word. \texttt{BEQ}, \texttt{BNE}, \texttt{BLT}, \texttt{BGE a b label}:
+\texttt{a}, \texttt{b} are LRs or CRs, compared signed. \texttt{BR reg} jumps to
+a register's value; \texttt{BKPT} ends the program. \texttt{BGT}, \texttt{BLE},
+\texttt{BZ}, \texttt{BNZ} and \texttt{B} assemble into these. A taken branch
+executes its target in the next cycle.
+
+%======================================================================
+\section{Timing within a word}\label{sec:timing}
+
+The slots of a word run in this order: the three \texttt{lr}
 slots, \texttt{load}, \texttt{mult}, \texttt{acc}, \texttt{aaq},
 \texttt{store}, \texttt{cond}. Some reads see a result written earlier in
 the same word; others see the value from the start of the cycle.
@@ -400,17 +661,26 @@ cycle: a row loaded in this word reaches the multiplier one word later \\
 \texttt{ACC.RESHAPE}, which reads the start-of-cycle value) \\
 \texttt{R\_ACC} by \texttt{aaq} & this word's accumulate \\
 \texttt{POST\_AAQ\_REG} by \texttt{store} & this word's activation \\
-LR address offsets of \texttt{load}, \texttt{mult}, \texttt{store} & this
+LR operands of \texttt{load}, \texttt{mult}, \texttt{store} & this
 word's \texttt{lr} updates \\
-LR and CR sources of \texttt{lr} and \texttt{cond} & start of the cycle \\
+LR and CR sources of \texttt{lr} and \texttt{cond} & start of the cycle: two
+chained \texttt{ADD}s take two words \\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-This is why the \texttt{identity} loop puts \texttt{MULT.VE} and
-\texttt{ACC.ADD.FIRST} in one word, and \texttt{ACTIVATE.QUANTIZE} and
-\texttt{STR\_POST\_AAQ\_REG} in another, but loads \texttt{R0} one word
-before multiplying it.
+\subsection{Consequences for loops}
+
+\begin{itemize}
+\item \textbf{Branches compare the pre-update value.} With
+  \texttt{ADD LR1 LR1 CR1 ; BLT LR1 CR4 loop ;;} and \texttt{LR1} starting at 0,
+  the loop runs \texttt{CR4}$+1$ times; start at 1 for \texttt{CR4} times.
+\item \textbf{Load and store addresses include this word's \texttt{ADD}.} To
+  store row $i$ while advancing its pointer, start the pointer one lower.
+\item \textbf{The epilogue fits one word}: last accumulate, activation, store.
+\item \textbf{\texttt{AGG}} reads its destination LR at the start of the
+  cycle.
+\end{itemize}
 
 %======================================================================
 \section{Installing}
@@ -532,8 +802,6 @@ Name & Use \\
 %======================================================================
 \section{How the repository is organised}
 
-The repository contains the assembler, the emulator and the kernel library:
-
 \begin{filetree}
 src/tools/
   ipu-as-py/             assembler (.asm -> .bin)
@@ -566,8 +834,7 @@ residual_add/
 \end{filetree}
 
 The arguments of each case's \texttt{prepare} function become command-line
-options of the kernel (section~\ref{sec:args}). Section~\ref{sec:newkernel}
-builds a complete kernel, file by file.
+options of the kernel (section~\ref{sec:args}).
 
 \subsection{Families and Bazel targets}
 
@@ -728,6 +995,7 @@ negative_outputs
 \texttt{--case negative\_outputs} runs the second one.
 
 %======================================================================
+\addtocontents{toc}{\protect\newpage}
 \section{Passing arguments}\label{sec:args}
 
 \begin{note}
@@ -759,7 +1027,7 @@ options:
 \end{termout}
 
 \texttt{--channels}, \texttt{--height}, \texttt{--width} and \texttt{--seed}
-come from this kernel's \texttt{cases.py}; other kernels have their own.
+come from this kernel's \texttt{cases.py}.
 
 \subsection{Problem size}
 
@@ -801,7 +1069,7 @@ depthwise_conv_universal/default: PASS (702 cycles)
 
 \subsection{Errors}
 
-A shape the kernel does not support is refused before anything runs:
+An unsupported shape is refused before anything runs:
 
 \begin{termcmdtop}
 $ bazel run //src/tools/ipu-apps:depthwise_conv_universal -- --channels 3 --width 200
@@ -881,7 +1149,7 @@ $ bazel test //src/tools/ipu-apps:test_full_layer_l5 --test_arg=-k \
 \end{termcmd}
 
 %======================================================================
-\section{Debugging}
+\section{Debugging}\label{sec:debug}
 
 Add \texttt{--config=debug} to any run (reference: \doc{debugging}{Debugging}). The debugger opens stopped before the
 first instruction; every argument from section~\ref{sec:args} still works.
@@ -1045,102 +1313,6 @@ them).
 \end{itemize}
 
 %======================================================================
-\section{ISA aliases}
-
-The IPU instruction set has gaps: there is, for example, no instruction that
-adds two vectors. Kernels fill a gap with a sequence of other instructions ---
-to add two vectors, multiply each by 1.0 and accumulate. Such a sequence is an
-\textbf{alias}. The \doc{isa-alias-catalogue}{ISA Alias Catalogue} lists them as
-A1--A16; counting them shows which new instructions would help most.
-
-\subsection{Alias counts}
-
-\begin{termcmdtop}
-$ bazel run //src/tools/ipu-apps:residual_add
-\end{termcmdtop}
-\begin{termout}
-residual_add/default: PASS (325 cycles)
-...
-Identity mult:            128  (100.0% of active)
-Effective MAC:           0.0%
---- ISA alias hits ---
-A1_MOV_RC:                 64
-A2_ADD_VV:                 64
-A16_STR_ACC_REG:           64
-\end{termout}
-
-Every multiply is a multiply by 1.0 (\texttt{Identity mult: 100\%}), so no
-real arithmetic happens in the multiplier (\texttt{Effective MAC: 0.0\%}).
-Per channel (64 channels): one \texttt{A1\_MOV\_RC} (move A into the
-accumulator), one \texttt{A2\_ADD\_VV} (add B) and one
-\texttt{A16\_STR\_ACC\_REG} (store with a simulation-only instruction).
-
-\subsection{Aliases in the debugger}
-
-In figure~\ref{fig:rastep}, PC 4 and PC 6 are the aliases:
-\texttt{MULT.RC.VE ... cr1} multiplies by \texttt{CR1} = 1.0;
-\texttt{ACC.ADD.FIRST} starts the sum (A1), \texttt{ACC.ADD} adds the second
-vector (A2).
-
-\needspace{6cm}
-\subsection{Alias report}
-
-\begin{termcmdtop}
-$ bazel run //src/tools/ipu-apps:residual_add -- --profile-aliases
-\end{termcmdtop}
-\begin{termout}
---- Full ISA measurements (overlapping; no savings estimates) ---
-A2_ADD_VV/default: 64 occurrences (verified), 64 participating cycles
-A1_MOV_RC/default: 64 occurrences (verified), 64 participating cycles
-A16_STR_ACC_REG/default: 64 occurrences (verified), 64 participating cycles
-A12_ADDRESSING/load_to_mult: 128 occurrences (verified), 256 participating cycles
-A12_ADDRESSING/address_update: 64 occurrences (verified), 128 participating cycles
-A13_NARROW_MULT/lanes_128: 128 occurrences (verified), 128 participating cycles
-\end{termout}
-
-\texttt{--alias-report FILE} writes the same as JSON, including where each
-alias occurs (\texttt{sites}: program counter $\rightarrow$ count) and
-examples:
-
-\begin{termcmdtop}
-$ bazel run //src/tools/ipu-apps:residual_add -- --alias-report aliases.json
-\end{termcmdtop}
-\begin{termout}
-"A2_ADD_VV": {
-  "name": "ADD.VV",
-  "measurements": [{ "status": "verified", "count": 64, "sites": { "6": 64 },
-      "examples": [{ "events": [
-          { "cycle": 7, "pc": 6, "slot": "mult", "instruction": "MULT.RC.VE" },
-          { "cycle": 7, "pc": 6, "slot": "acc",  "instruction": "ACC.ADD" } ] }, ...
-\end{termout}
-
-\subsection{Benchmarks}
-
-A kernel with a \texttt{benchmark.py} runs its benchmark sizes and prints the
-statistics and alias counts per size:
-
-\begin{termcmdtop}
-$ bazel run //src/tools/ipu-apps:benchmark_depthwise_conv_universal
-\end{termcmdtop}
-\begin{termout}
-=== depthwise_conv_universal benchmark ===
-config                            cycles  cyc/channels  mult%   acc%  lanes%  ident%  effMAC%
----------------------------------------------------------------------------------------------
-height=16,width=16,channels=8        180         22.50  80.0%  80.0%   73.5%    0.0%    73.5%
-height=64,width=64,channels=64     19686        307.59  93.6%  93.6%   91.7%    0.0%    91.7%
-...
-ISA aliases: A7 REDUCE_SEG  A12 ADDRESSING  A13 NARROW_MULT  A14 MULTIPLE_ACC
-config                                  A7   A12    A13   A14
--------------------------------------------------------------
-height=16,width=16,channels=8        0+93?    50    144    32
-height=64,width=64,channels=64    0+10238?  6396  18432  4504
-...
-wrote .../kernels/convolutions/depthwise_conv_universal/results.md
-\end{termout}
-
-\texttt{0+93?} means 0 verified and 93 unverified candidate occurrences.
-
-%======================================================================
 \section{Assembling a kernel}\label{sec:asm}
 
 \needspace{5.6cm}
@@ -1187,7 +1359,7 @@ Command & Does \\
 \end{center}
 
 %======================================================================
-\section{Adding a new kernel}\label{sec:newkernel}
+\section{Writing a kernel}\label{sec:newkernel}
 
 A complete example kernel, \texttt{double\_rows}: $y = 2x$ for a matrix of
 128-element FP32 rows, built from the smallest existing kernel,
@@ -1333,7 +1505,8 @@ $ bazel run //src/tools/ipu-apps:double_rows
 
 \texttt{Identity mult: 100\%} and the aliases \texttt{A1\_MOV\_RC} /
 \texttt{A2\_ADD\_VV}: doubling by adding a row to itself spends the multiplier
-on data movement.
+on data movement; section~\ref{sec:onerow} cuts this kernel from 386 to 67
+cycles on 64 rows.
 
 \needspace{0.3\textheight}
 \subsection{Test it}
@@ -1368,7 +1541,326 @@ input row (pane 1); PC 3 is about to add it a second time.}
 \end{itemize}
 
 %======================================================================
-\section{Prototyping}
+\section{ISA aliases}\label{sec:aliases}
+
+The IPU instruction set has gaps: there is, for example, no instruction that
+adds two vectors. Kernels fill a gap with a sequence of other instructions ---
+to add two vectors, multiply each by 1.0 and accumulate. Such a sequence is an
+\textbf{alias}, and it costs multiplier cycles: every accumulator instruction
+reads \texttt{MULT\_RES}, so any data reaching \texttt{R\_ACC} passes through
+the multiplier. The \doc{isa-alias-catalogue}{ISA Alias Catalogue} lists them
+as A1--A16.
+
+\subsection{Alias counts}
+
+\begin{termcmdtop}
+$ bazel run //src/tools/ipu-apps:residual_add
+\end{termcmdtop}
+\begin{termout}
+residual_add/default: PASS (325 cycles)
+...
+Identity mult:            128  (100.0% of active)
+Effective MAC:           0.0%
+--- ISA alias hits ---
+A1_MOV_RC:                 64
+A2_ADD_VV:                 64
+A16_STR_ACC_REG:           64
+\end{termout}
+
+Every multiply is a multiply by 1.0 (\texttt{Identity mult: 100\%}), so no
+real arithmetic happens in the multiplier (\texttt{Effective MAC: 0.0\%}).
+Per channel (64 channels): one \texttt{A1\_MOV\_RC} (move A into the
+accumulator), one \texttt{A2\_ADD\_VV} (add B) and one
+\texttt{A16\_STR\_ACC\_REG} (store with a simulation-only instruction).
+
+\subsection{Aliases in the debugger}
+
+In figure~\ref{fig:rastep}, PC 4 and PC 6 are the aliases:
+\texttt{MULT.RC.VE ... cr1} multiplies by \texttt{CR1} = 1.0;
+\texttt{ACC.ADD.FIRST} starts the sum (A1), \texttt{ACC.ADD} adds the second
+vector (A2).
+
+\needspace{6cm}
+\subsection{Alias report}
+
+\begin{termcmdtop}
+$ bazel run //src/tools/ipu-apps:residual_add -- --profile-aliases
+\end{termcmdtop}
+\begin{termout}
+--- Full ISA measurements (overlapping; no savings estimates) ---
+A2_ADD_VV/default: 64 occurrences (verified), 64 participating cycles
+A1_MOV_RC/default: 64 occurrences (verified), 64 participating cycles
+A16_STR_ACC_REG/default: 64 occurrences (verified), 64 participating cycles
+A12_ADDRESSING/load_to_mult: 128 occurrences (verified), 256 participating cycles
+A12_ADDRESSING/address_update: 64 occurrences (verified), 128 participating cycles
+A13_NARROW_MULT/lanes_128: 128 occurrences (verified), 128 participating cycles
+\end{termout}
+
+\texttt{--alias-report FILE} writes the same as JSON, including where each
+alias occurs (\texttt{sites}: program counter $\rightarrow$ count) and
+examples:
+
+\begin{termcmdtop}
+$ bazel run //src/tools/ipu-apps:residual_add -- --alias-report aliases.json
+\end{termcmdtop}
+\begin{termout}
+"A2_ADD_VV": {
+  "name": "ADD.VV",
+  "measurements": [{ "status": "verified", "count": 64, "sites": { "6": 64 },
+      "examples": [{ "events": [
+          { "cycle": 7, "pc": 6, "slot": "mult", "instruction": "MULT.RC.VE" },
+          { "cycle": 7, "pc": 6, "slot": "acc",  "instruction": "ACC.ADD" } ] }, ...
+\end{termout}
+
+\subsection{Benchmarks}
+
+A kernel with a \texttt{benchmark.py} runs its benchmark sizes and prints the
+statistics and alias counts per size:
+
+\begin{termcmdtop}
+$ bazel run //src/tools/ipu-apps:benchmark_depthwise_conv_universal
+\end{termcmdtop}
+\begin{termout}
+=== depthwise_conv_universal benchmark ===
+config                            cycles  cyc/channels  mult%   acc%  lanes%  ident%  effMAC%
+---------------------------------------------------------------------------------------------
+height=16,width=16,channels=8        180         22.50  80.0%  80.0%   73.5%    0.0%    73.5%
+height=64,width=64,channels=64     19686        307.59  93.6%  93.6%   91.7%    0.0%    91.7%
+...
+ISA aliases: A7 REDUCE_SEG  A12 ADDRESSING  A13 NARROW_MULT  A14 MULTIPLE_ACC
+config                                  A7   A12    A13   A14
+-------------------------------------------------------------
+height=16,width=16,channels=8        0+93?    50    144    32
+height=64,width=64,channels=64    0+10238?  6396  18432  4504
+...
+wrote .../kernels/convolutions/depthwise_conv_universal/results.md
+\end{termout}
+
+\texttt{0+93?} means 0 verified and 93 unverified candidate occurrences.
+
+%======================================================================
+\section{Making kernels faster}\label{sec:fast}
+
+\subsection{Cost model}
+
+One word per cycle: run time is words executed, plus bank stalls. Two ways to
+cut it:
+
+\begin{itemize}
+\item \textbf{Less work}: fewer instructions per result, and multiplies that do
+  arithmetic rather than $\times 1$ moves.
+\item \textbf{Overlap}: independent instructions share a word and cost one
+  cycle together.
+\end{itemize}
+
+The multiplier sets the peak: one 128-lane multiply per cycle.
+\texttt{Effective MAC} in the run summary is the share of that peak doing real
+arithmetic, excluding $\times 1$ moves and idle lanes. Target: one word per
+inner-loop iteration, holding the next load, the multiply, the accumulate, the
+pointer updates and the branch.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{lrrX}
+\toprule
+Kernel (default case) & Cycles & Eff.\ MAC & Inner loop \\
+\midrule
+\texttt{matmul\_144x144\_x128} & 43921 & 94.4\,\% & one word per step \\
+\texttt{matmul\_128x128} & 34055 & 48.1\,\% & two words per step, one only
+updating pointers \\
+\texttt{residual\_add} & 325 & 0.0\,\% & $\times 1$ moves only \\
+\texttt{softmax\_rows} & 2323 & 16.5\,\% & 40\,\% $\times 1$ moves;
+load, multiply, update and branch in separate words \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Example: \texttt{double\_rows}}\label{sec:onerow}
+
+The kernel of section~\ref{sec:newkernel}, on 64 rows:
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Version & Words per row & Multiplies per row & Cycles & Eff.\ MAC \\
+\midrule
+$x \cdot 1 + x \cdot 1$ (section~\ref{sec:newkernel}) & 6 & 2 & 386 & 0.0\,\% \\
+$x \cdot 2$ & 5 & 1 & 322 & 19.9\,\% \\
+$x \cdot 2$, one word per row & 1 & 1 & 67 & 95.5\,\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Less work: multiply by 2.} The two $\times 1$ multiplies (aliases A1
+and A2) become one multiply by a CR holding 2; a CR scalar is a signed integer,
+so 2 is exact (section~\ref{sec:isa}). In \texttt{app.py}, set \texttt{CR5}:
+
+\begin{pycode}
+        return MemoryLayout(rows, rows, {2: 0, 3: rows, 4: rows, 5: 2})
+\end{pycode}
+
+and in \texttt{double\_rows.asm} replace the two multiply words with one:
+
+\begin{pycode}
+    MULT.VE {{lr_zero}} cr5 0 {{lr_zero}} cr15 ;
+    ACC.ADD.FIRST ;;
+\end{pycode}
+
+\needspace{0.42\textheight}
+\textbf{Overlap: one word per row.} Load, multiply, store, pointer update and
+branch still take five words. Loading row $i+1$ while multiplying and storing
+row $i$ puts them in one:
+
+\begin{pycode}
+    SET LR0 CR0 ;                       # LR0 = 0 (index and shift)
+    SET LR1 CR0 ;                       # LR1 = 0
+    SET LR2 CR1 ;;                      # LR2 = 1
+    SUB LR3 LR1 CR1 ;                   # LR3 = -1
+    LDR_MULT_REG R0 LR1 CR2 ;;          # prime: row 0 -> R0
+row_loop:                               # one word per row i:
+    ADD LR1 LR1 CR1 ;                   #   LR1: i -> i+1
+    ADD LR2 LR2 CR1 ;                   #   LR2: i+1 -> i+2
+    ADD LR3 LR3 CR1 ;                   #   LR3: i-1 -> i
+    LDR_MULT_REG R0 LR1 CR2 ;           #   row i+1 -> R0, for the next word
+    MULT.VE LR0 CR5 0 LR0 CR15 ;        #   row i (loaded last word) x 2
+    ACC.ADD.FIRST ;
+    ACTIVATE.QUANTIZE identity CR15 ;
+    STR_POST_AAQ_REG LR3 CR3 ;          #   store row i
+    BLT LR2 CR4 row_loop ;;             #   continue while i+1 < CR4
+    BKPT ;;
+\end{pycode}
+
+\begin{itemize}
+\item Load and store see this word's \texttt{ADD}s: \texttt{LR1} $= i+1$,
+  \texttt{LR3} $= i$.
+\item \texttt{BLT} sees \texttt{LR2} before its \texttt{ADD}: $i+1$.
+\item Three counters fill the three LR slots.
+\end{itemize}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[
+  c/.style={draw=white, minimum width=7.4mm, minimum height=5mm, inner sep=0,
+            font=\sffamily\tiny},
+  L/.style={c, fill=accent!25}, M/.style={c, fill=accent!60, text=white},
+  S/.style={c, fill=teal!45}, X/.style={c, fill=outframe},
+  lab/.style={font=\sffamily\scriptsize, anchor=east}]
+\newcommand{\track}[3]{% y, label, cells: style/text
+  \node[lab] at (-1mm, #1) {#2};
+  \foreach \s/\t [count=\i from 0] in {#3}
+    \node[\s] at (\i*7.6mm+3.7mm, #1) {\t};}
+\node[font=\sffamily\scriptsize\bfseries, anchor=west] at (-17mm, 5.5mm)
+  {$x \cdot 2$: 5 words per row};
+\track{0}{\texttt{load}}{L/0,c/,c/,c/,c/,L/1,c/,c/,c/,c/,L/2,c/,c/,c/}
+\track{-5.2mm}{\texttt{mult}}{c/,M/0,c/,c/,c/,c/,M/1,c/,c/,c/,c/,M/2,c/,c/}
+\track{-10.4mm}{\texttt{store}}{c/,c/,S/0,c/,c/,c/,c/,S/1,c/,c/,c/,c/,S/2,c/}
+\track{-15.6mm}{\texttt{lr}, \texttt{cond}}{c/,c/,c/,X/,X/,c/,c/,c/,X/,X/,c/,c/,c/,X/}
+\node[font=\sffamily\scriptsize\bfseries, anchor=west] at (-17mm, -23mm)
+  {$x \cdot 2$, one word per row};
+\track{-28.5mm}{\texttt{load}}{c/,L/0,L/1,L/2,L/3,L/4,L/5,L/6,L/7,L/8,L/9,L/10,L/11,L/12}
+\track{-33.7mm}{\texttt{mult}}{c/,c/,M/0,M/1,M/2,M/3,M/4,M/5,M/6,M/7,M/8,M/9,M/10,M/11}
+\track{-38.9mm}{\texttt{store}}{c/,c/,S/0,S/1,S/2,S/3,S/4,S/5,S/6,S/7,S/8,S/9,S/10,S/11}
+\track{-44.1mm}{\texttt{lr}, \texttt{cond}}{X/,X/,X/,X/,X/,X/,X/,X/,X/,X/,X/,X/,X/,X/}
+\draw[-{Stealth[length=1.8mm]}, muted] (0, -48mm) -- node[below,
+  font=\sffamily\scriptsize, text=muted] {cycles} (106mm, -48mm);
+\end{tikzpicture}
+\caption{The first 14 cycles; numbers are rows.}
+\end{figure}
+
+\subsection{Techniques from the kernel library}
+
+\textbf{Counters stay in the loop word.} \texttt{matmul\_144x144\_x128}:
+
+\begin{pycode}
+k_loop:
+    MULT.RC.VE LR0 LR5 0 LR0 CR15 ;     # ring x weight R0[LR5]
+    ACC.ADD ;
+    LDR_CYCLIC_MULT_REG LR4 CR0 LR0 ;   # next activation row -> ring slot 0
+    ADD LR4 LR4 LR2 ;                   # next row
+    ADD LR5 LR5 CR1 ;                   # next weight
+    BLT LR5 LR6 k_loop ;;
+\end{pycode}
+
+The multiply reads \texttt{LR5} after the \texttt{ADD}, the branch before it;
+\texttt{LR5} starts one lower to suit both.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.72\linewidth]{images/dbg_matmul_loop.png}
+\caption{The loop word in the debugger's stages view
+(section~\ref{sec:debug}): CTRL, MULT, ACC and the XMEM load all work in the
+same cycle.}
+\end{figure}
+
+\needspace{3\baselineskip}
+\textbf{The ring as a rotating buffer.} \texttt{depthwise\_conv\_universal}
+holds a $3\times3$ window's three input rows in ring slots and loads the next
+channel's rows into the free slots during the current channel's taps;
+\texttt{INCR\_MOD\_POW2 LR5 CR9 9} rotates the slot pointer.
+
+\textbf{One pointer for all taps.} One \texttt{rc} register walks the nine taps:
+$+1$ within a tap row, a CR step between rows. A mask shift of $\pm 1$ clears the
+left and right image edges, with \texttt{partition} grouping lanes into image
+rows; dedicated masks in \texttt{R\_MASK} clear the top and bottom rows.
+
+\textbf{Epilogue in the last tap.} The last accumulate and
+\texttt{ACTIVATE.QUANTIZE} share the ninth tap's word. That word's three LR
+slots are full, so the store and its pointer \texttt{ADD} go into the next
+channel's second tap: 9 words per channel, down from 11.
+
+\textbf{Packed lanes.} The convolutions pack $128/W$ image rows of width
+$W \in \{16, 32, 64, 128\}$ into one XMEM row. The depthwise kernel packs the
+nine weights of 28 channels ($28 \times 9 = 252$) into
+\texttt{R0}:\texttt{R1}.
+
+%======================================================================
+\section{Data layout in XMEM}\label{sec:layout}
+
+A multiply consumes one 128-element row, so the layout decides which dimension
+runs across the lanes.
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[
+  row/.style={draw=accent, fill=accent!8, minimum height=5mm, minimum width=36mm,
+              inner sep=0, font=\sffamily\scriptsize},
+  hot/.style={row, fill=accent!40},
+  cell/.style={draw=accent, fill=accent!8, minimum size=5mm, inner sep=0,
+               font=\sffamily\tiny},
+  lab/.style={font=\sffamily\scriptsize, text=muted},
+  arr/.style={-{Stealth[length=1.8mm]}, thick}]
+\node[lab, anchor=south] at (0, 3mm) {XMEM: $D$, one row per $k$};
+\foreach \t/\y/\s in {$D[0]$/0/row, $D[1]$/-6/row, $D[k]$/-12/hot, $\vdots$/-18/row,
+                      $D[K{-}1]$/-24/row}
+  \node[\s] at (0, \y mm) {\t};
+\node[lab] at (0, -30mm) {128 tokens across the lanes};
+\node[lab, anchor=south] at (58mm, 3mm) {\texttt{R0}:\texttt{R1}: $W[j, 0 \ldots K{-}1]$};
+\foreach \i/\s in {0/cell, 1/cell, 2/cell, 3/cell, 4/cell}
+  \node[\s] (w\i) at (46mm+\i*6mm, 0) {};
+\node[cell, fill=accent!40] (wk) at (46mm+2*6mm, 0) {$k$};
+\node[lab, anchor=west] at (76mm, 0) {one weight per word};
+\node[draw=accent, fill=accent!8, minimum height=5mm, minimum width=36mm,
+      font=\sffamily\scriptsize] (acc) at (58mm, -20mm) {\texttt{R\_ACC} $\mathrel{+}= D[k] \times W[j,k]$};
+\node[lab] at (58mm, -26mm) {after $K$ words: output row $C[j]$};
+\draw[arr] (18.5mm, -12mm) -- (39.5mm, -18mm);
+\draw[arr] (wk.south) -- (58mm, -17.5mm);
+\end{tikzpicture}
+\caption{Matrix multiply $C = W D$: \texttt{MULT.RC.VE} multiplies activation
+row $D[k]$ by the weight $W[j,k]$ selected from \texttt{R0}:\texttt{R1}.}
+\end{figure}
+
+\begin{itemize}
+\item \textbf{Lanes: tokens or pixels. Rows: channels} (channel-major).
+\item \textbf{Matrix multiply.} Weights output-major: $K \le 128$ fits in
+  \texttt{R0}, $K \le 256$ uses \texttt{R1} too.
+\item \textbf{More than 128 tokens.} One loop pass per group of 128;
+  \texttt{matmul\_144x144\_x128} runs 256 tokens as two groups.
+\item \textbf{Fewer than 128.} Pack several per row and set
+  \texttt{partition}, as the convolutions do; or pad and leave lanes idle.
+\item \textbf{Guard rows.} A pipelined loop reads one row before the first or
+  after the last; that row must exist.
+\end{itemize}
+
+%======================================================================
+\section{Prototyping}\label{sec:proto}
 
 \subsection{An alias as an instruction}
 
@@ -1401,8 +1893,8 @@ and the \texttt{A2\_ADD\_VV} count. Both runs must still print \texttt{PASS}.
 
 \subsection{Prototyping mode}
 
-For long runs, the emulator can skip work that does not change results (empty
 \needspace{5.9cm}
+For long runs, the emulator can skip work that does not change results (empty
 instruction slots, masks with every lane enabled). Results --- every register,
 every XMEM byte, the cycle count --- are identical to a normal run; only the
 emulator's own run time changes (details: \doc{prototyping-mode}{Prototyping mode}).
@@ -1425,11 +1917,12 @@ question about hardware cost.
 \section{Cheat sheet}
 
 \begin{tcolorbox}[enhanced, colback=white, colframe=muted, boxrule=0.8pt, arc=4pt,
-  left=10pt, right=10pt, top=8pt, bottom=6pt]
+  left=10pt, right=10pt, top=8pt, bottom=10pt]
 {\small
 All targets are in \texttt{//src/tools/ipu-apps} unless written in full;
 below, \texttt{:<target>} stands for \texttt{//src/tools/ipu-apps:<target>}.
 
+\raggedcolumns
 \begin{multicols}{2}
 \raggedright
 \textbf{\sffamily Find}\par
@@ -1468,6 +1961,14 @@ below, \texttt{:<target>} stands for \texttt{//src/tools/ipu-apps:<target>}.
 \texttt{bazel run --define=ipu\_proto=1 \textbackslash}\par
 \texttt{\ \ :<kernel>}\par
 
+\medskip\textbf{\sffamily Limits}\par
+\begin{tabular}{@{}ll@{}}
+128 words & per instruction bank \\
+0/128/256/384 & ring load index \\
+$-128$..$127$ & CR scalar in a multiply \\
+0..255 & \texttt{INC}/\texttt{DEC} step \\
+$-3$..$3$ & mask shift \\
+\end{tabular}\par
 \columnbreak
 \textbf{\sffamily Debug}\par
 \texttt{bazel run --config=debug :<kernel>}\par\smallskip
@@ -1510,6 +2011,7 @@ below, \texttt{:<target>} stands for \texttt{//src/tools/ipu-apps:<target>}.
 \texttt{LR0}--\texttt{LR15} & the program's counters \\
 \texttt{R\_ACC} & accumulator \\
 \end{tabular}
+
 \end{multicols}
 }
 \end{tcolorbox}
