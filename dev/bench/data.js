@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792841069382,
+  "lastUpdate": 1792841072007,
   "repoUrl": "https://github.com/yarden-carmi/ipu-emulator",
   "entries": {
     "Times and memory (smaller is better)": [
@@ -734,6 +734,64 @@ window.BENCHMARK_DATA = {
             "value": 5030.228408,
             "unit": "cycles/s",
             "extra": "default case; cycles=179281 run=35.641 s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "41898282+github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "41898282+github-actions[bot]@users.noreply.github.com"
+          },
+          "id": "0ca490a9ac5a1407e54e7bf561959896c8b08d22",
+          "message": "docs: refresh release log",
+          "timestamp": "2026-10-19T08:24:25Z",
+          "url": "https://github.com/yarden-carmi/ipu-emulator/commit/0ca490a9ac5a1407e54e7bf561959896c8b08d22"
+        },
+        "date": 1792841071347,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "assemble/words_per_s",
+            "value": 12928.221419,
+            "unit": "words/s",
+            "extra": "files=129 words=8256"
+          },
+          {
+            "name": "emulator/faithful/matmul_384x192_x128.default/cycles_per_s",
+            "value": 8993.621814,
+            "unit": "cycles/s",
+            "extra": "cycles=77185 best of 5: 8.582 s"
+          },
+          {
+            "name": "emulator/faithful/fully_connected.int8/cycles_per_s",
+            "value": 16103.713407,
+            "unit": "cycles/s",
+            "extra": "cycles=2674 best of 5: 0.166 s"
+          },
+          {
+            "name": "emulator/faithful/fully_connected.e4/cycles_per_s",
+            "value": 15154.696724,
+            "unit": "cycles/s",
+            "extra": "cycles=2674 best of 5: 0.176 s"
+          },
+          {
+            "name": "kernel/identity/cycles_per_s",
+            "value": 11117.869031,
+            "unit": "cycles/s",
+            "extra": "default case; cycles=17 run=0.002 s"
+          },
+          {
+            "name": "kernel/matmul_720x240_x128/cycles_per_s",
+            "value": 8833.198309,
+            "unit": "cycles/s",
+            "extra": "default case; cycles=179281 run=20.296 s"
           }
         ]
       }
